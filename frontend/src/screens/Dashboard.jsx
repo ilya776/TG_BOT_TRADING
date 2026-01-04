@@ -14,7 +14,7 @@ import {
 } from 'lucide-react'
 import { AreaChart, Area, ResponsiveContainer } from 'recharts'
 import { useDashboard } from '../hooks/useApi'
-import { formatCurrency, formatPercent, formatLargeNumber, shortenAddress } from '../services/api'
+import { formatCurrency, formatPercent, formatLargeNumber, shortenAddress, authApi } from '../services/api'
 
 const containerVariants = {
   hidden: { opacity: 0 },
@@ -112,7 +112,10 @@ function Dashboard() {
             <div>
               <p className="text-white font-semibold text-sm">Demo Mode</p>
               <p className="text-gray-400 text-xs">
-                Open in Telegram to unlock full features
+                {authApi.isInTelegram()
+                  ? 'Connecting to your account...'
+                  : 'Open in Telegram to unlock full features'
+                }
               </p>
             </div>
           </div>
@@ -290,7 +293,10 @@ function WhaleCard({ whale, index }) {
   const chartData = whale.chart_data?.map((value) => ({ value })) ||
     [40, 45, 42, 55, 60, 58, 65, 70, 68, 75, 80, 85].map((value) => ({ value }))
 
-  const weeklyPnl = whale.pnl_percent_7d || whale.pnl_7d_percent || whale.weekly_pnl || 0
+  // Map backend fields to frontend expectations
+  const weeklyPnl = parseFloat(whale.stats?.profit_7d || whale.pnl_percent_7d || whale.pnl_7d_percent || 0)
+  const winRate = parseFloat(whale.stats?.win_rate || whale.win_rate || 0)
+  const totalTrades = whale.stats?.total_trades || whale.total_trades_7d || 0
   const isFollowing = whale.is_following || false
   const whaleName = whale.name || whale.whale_name || 'Unknown Whale'
 
@@ -322,7 +328,7 @@ function WhaleCard({ whale, index }) {
             <h3 className="font-semibold text-white truncate">{whaleName}</h3>
           </div>
           <p className="text-xs text-gray-500 font-mono">
-            {whale.wallet_address ? shortenAddress(whale.wallet_address) : `${whale.total_trades_7d || 0} trades`}
+            {whale.wallet_address ? shortenAddress(whale.wallet_address) : `${totalTrades} trades`}
           </p>
         </div>
 
@@ -354,7 +360,7 @@ function WhaleCard({ whale, index }) {
           }`}>
             {formatPercent(weeklyPnl)}
           </div>
-          <p className="text-xs text-gray-500">{whale.win_rate || 0}% win</p>
+          <p className="text-xs text-gray-500">{winRate.toFixed(0)}% win</p>
         </div>
       </div>
     </motion.div>

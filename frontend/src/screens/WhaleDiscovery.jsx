@@ -220,10 +220,16 @@ function WhaleDiscoveryCard({ whale, index, onClick, onFollow, onUnfollow }) {
   const chartData = whale.chart_data?.map((value) => ({ value })) ||
     [40, 45, 42, 55, 60, 58, 65, 70, 68, 75, 80, 85].map(v => ({ value: v }))
 
-  const weeklyPnl = whale.stats?.pnl_7d_percent || whale.pnl_7d_percent || 0
-  const winRate = whale.stats?.win_rate || whale.win_rate || 0
-  const totalProfit = whale.stats?.total_pnl || whale.total_profit || 0
+  // Map backend fields to frontend expectations
+  const weeklyPnl = whale.stats?.profit_7d || whale.stats?.pnl_7d_percent || 0
+  const winRate = parseFloat(whale.stats?.win_rate || 0)
+  const totalProfit = parseFloat(whale.stats?.total_profit_usd || whale.stats?.total_pnl || 0)
   const followers = whale.followers_count || 0
+
+  // Parse tags - backend returns string like "tag1,tag2", frontend expects array
+  const tags = typeof whale.tags === 'string' && whale.tags
+    ? whale.tags.split(',').map(t => t.trim())
+    : (Array.isArray(whale.tags) ? whale.tags : [])
 
   const handleFollowClick = async (e) => {
     e.stopPropagation()
@@ -273,16 +279,18 @@ function WhaleDiscoveryCard({ whale, index, onClick, onFollow, onUnfollow }) {
             <p className="text-xs text-gray-500 font-mono">
               {shortenAddress(whale.wallet_address)}
             </p>
-            <div className="flex gap-1 mt-1">
-              {whale.tags?.slice(0, 2).map((tag) => (
-                <span
-                  key={tag}
-                  className="text-[10px] px-1.5 py-0.5 rounded-full bg-biolum-purple/10 text-biolum-purple"
-                >
-                  {tag}
-                </span>
-              ))}
-            </div>
+            {tags.length > 0 && (
+              <div className="flex gap-1 mt-1">
+                {tags.slice(0, 2).map((tag) => (
+                  <span
+                    key={tag}
+                    className="text-[10px] px-1.5 py-0.5 rounded-full bg-biolum-purple/10 text-biolum-purple"
+                  >
+                    {tag}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
         </div>
 
@@ -367,11 +375,17 @@ function WhaleDetailModal({ whale, onClose, onFollow, onUnfollow, onUpdateFollow
   const chartData = whale.chart_data?.map((value) => ({ value })) ||
     [40, 45, 42, 55, 60, 58, 65, 70, 68, 75, 80, 85].map(v => ({ value: v }))
 
-  const weeklyPnl = whale.stats?.pnl_7d_percent || whale.pnl_7d_percent || 0
-  const winRate = whale.stats?.win_rate || whale.win_rate || 0
-  const totalProfit = whale.stats?.total_pnl || whale.total_profit || 0
-  const totalTrades = whale.stats?.total_trades || whale.total_trades || 0
+  // Map backend fields to frontend expectations
+  const weeklyPnl = parseFloat(whale.stats?.profit_7d || whale.stats?.pnl_7d_percent || 0)
+  const winRate = parseFloat(whale.stats?.win_rate || 0)
+  const totalProfit = parseFloat(whale.stats?.total_profit_usd || whale.stats?.total_pnl || 0)
+  const totalTrades = whale.stats?.total_trades || 0
   const followers = whale.followers_count || 0
+
+  // Parse tags - backend returns string like "tag1,tag2", frontend expects array
+  const tags = typeof whale.tags === 'string' && whale.tags
+    ? whale.tags.split(',').map(t => t.trim())
+    : (Array.isArray(whale.tags) ? whale.tags : [])
 
   const handleAction = async () => {
     setIsLoading(true)
@@ -460,16 +474,18 @@ function WhaleDetailModal({ whale, onClose, onFollow, onUnfollow, onUpdateFollow
                 <Wallet size={14} />
                 {shortenAddress(whale.wallet_address)}
               </p>
-              <div className="flex gap-2 mt-2">
-                {whale.tags?.map((tag) => (
-                  <span
-                    key={tag}
-                    className="text-xs px-2 py-1 rounded-full bg-biolum-purple/10 text-biolum-purple"
-                  >
-                    {tag}
-                  </span>
-                ))}
-              </div>
+              {tags.length > 0 && (
+                <div className="flex gap-2 mt-2">
+                  {tags.map((tag) => (
+                    <span
+                      key={tag}
+                      className="text-xs px-2 py-1 rounded-full bg-biolum-purple/10 text-biolum-purple"
+                    >
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
 

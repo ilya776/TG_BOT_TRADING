@@ -21,6 +21,7 @@ import {
   Loader2
 } from 'lucide-react'
 import { useUser, useApiKeys } from '../hooks/useApi'
+import { authApi } from '../services/api'
 
 const tradingModes = [
   {
@@ -180,7 +181,10 @@ function SettingsScreen() {
             <div>
               <p className="text-white font-semibold text-sm">Demo Mode</p>
               <p className="text-gray-400 text-xs">
-                Open this app in Telegram to connect your exchange and start trading
+                {authApi.isInTelegram()
+                  ? 'Authentication in progress... Please wait or refresh the app'
+                  : 'Open this app in Telegram to connect your exchange and start trading'
+                }
               </p>
             </div>
           </div>

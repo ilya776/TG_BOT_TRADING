@@ -7,10 +7,25 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || '/api/v1';
 
 // Get Telegram WebApp data for authentication
 const getTelegramInitData = () => {
-  if (window.Telegram?.WebApp?.initData) {
-    return window.Telegram.WebApp.initData;
+  // Check if Telegram WebApp is available
+  if (typeof window !== 'undefined' && window.Telegram?.WebApp) {
+    const initData = window.Telegram.WebApp.initData;
+    // initData can be empty string if not in Telegram context
+    if (initData && initData.length > 0) {
+      console.log('Telegram initData available');
+      return initData;
+    }
+    console.log('Telegram WebApp available but initData is empty');
   }
+  console.log('Telegram WebApp not available');
   return null;
+};
+
+// Check if running inside Telegram
+const isInTelegram = () => {
+  return typeof window !== 'undefined' &&
+    window.Telegram?.WebApp?.initData &&
+    window.Telegram.WebApp.initData.length > 0;
 };
 
 // Create headers with authentication
@@ -164,6 +179,9 @@ export const authApi = {
 
   // Get Telegram init data
   getTelegramInitData,
+
+  // Check if in Telegram
+  isInTelegram,
 };
 
 // ==================== USER API ====================
