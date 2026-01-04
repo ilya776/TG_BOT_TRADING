@@ -19,11 +19,6 @@ const getHeaders = () => {
     'Content-Type': 'application/json',
   };
 
-  const initData = getTelegramInitData();
-  if (initData) {
-    headers['X-Telegram-Init-Data'] = initData;
-  }
-
   const token = localStorage.getItem('auth_token');
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
@@ -54,6 +49,121 @@ const apiRequest = async (endpoint, options = {}) => {
     console.error(`API Error [${endpoint}]:`, error);
     throw error;
   }
+};
+
+// ==================== AUTH API ====================
+
+export const authApi = {
+  // Authenticate with Telegram init data
+  authenticateTelegram: async (initData) => {
+    const response = await fetch(`${API_BASE_URL}/auth/telegram`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ init_data: initData }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ detail: 'Authentication failed' }));
+      throw new Error(error.detail || 'Authentication failed');
+    }
+
+    const data = await response.json();
+
+    // Store tokens
+    if (data.access_token) {
+      localStorage.setItem('auth_token', data.access_token);
+    }
+    if (data.refresh_token) {
+      localStorage.setItem('refresh_token', data.refresh_token);
+    }
+
+    return data;
+  },
+
+  // Refresh access token
+  refreshToken: async () => {
+    const refreshToken = localStorage.getItem('refresh_token');
+    if (!refreshToken) {
+      throw new Error('No refresh token');
+    }
+
+    const response = await fetch(`${API_BASE_URL}/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+
+    if (!response.ok) {
+      // Clear tokens on refresh failure
+      localStorage.removeItem('auth_token');
+      localStorage.removeItem('refresh_token');
+      throw new Error('Token refresh failed');
+    }
+
+    const data = await response.json();
+
+    // Update tokens
+    if (data.access_token) {
+      localStorage.setItem('auth_token', data.access_token);
+    }
+    if (data.refresh_token) {
+      localStorage.setItem('refresh_token', data.refresh_token);
+    }
+
+    return data;
+  },
+
+  // Check current auth status
+  checkAuth: async () => {
+    const token = localStorage.getItem('auth_token');
+    if (!token) {
+      return { authenticated: false, user: null };
+    }
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/auth/me`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      if (!response.ok) {
+        return { authenticated: false, user: null };
+      }
+
+      return await response.json();
+    } catch {
+      return { authenticated: false, user: null };
+    }
+  },
+
+  // Auto-authenticate using Telegram WebApp
+  autoAuth: async () => {
+    const initData = getTelegramInitData();
+    if (!initData) {
+      console.log('No Telegram init data available');
+      return null;
+    }
+
+    try {
+      return await authApi.authenticateTelegram(initData);
+    } catch (error) {
+      console.error('Auto-auth failed:', error);
+      return null;
+    }
+  },
+
+  // Logout
+  logout: () => {
+    localStorage.removeItem('auth_token');
+    localStorage.removeItem('refresh_token');
+  },
+
+  // Check if user is authenticated
+  isAuthenticated: () => {
+    return !!localStorage.getItem('auth_token');
+  },
+
+  // Get Telegram init data
+  getTelegramInitData,
 };
 
 // ==================== USER API ====================
@@ -319,6 +429,7 @@ export const shortenAddress = (address) => {
 
 // Default export with all APIs
 export default {
+  auth: authApi,
   user: userApi,
   whales: whalesApi,
   trades: tradesApi,

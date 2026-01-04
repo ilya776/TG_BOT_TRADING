@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from app.api.deps import CurrentUser, DbSession
+from app.api.deps import CurrentUser, DbSession, OptionalUser
 from app.models.signal import (
     SignalAction,
     SignalConfidence,
@@ -58,8 +58,8 @@ class SignalResponse(BaseModel):
 
 @router.get("", response_model=list[SignalResponse])
 async def list_signals(
-    current_user: CurrentUser,
     db: DbSession,
+    current_user: OptionalUser = None,
     whale_id: int | None = None,
     action: SignalAction | None = None,
     status_filter: SignalStatus | None = None,
@@ -68,26 +68,30 @@ async def list_signals(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> list[SignalResponse]:
-    """Get recent whale signals for followed whales."""
-    # Get user's followed whale IDs
-    follows_result = await db.execute(
-        select(UserWhaleFollow.whale_id, UserWhaleFollow.auto_copy_enabled).where(
-            UserWhaleFollow.user_id == current_user.id
+    """Get recent whale signals. Public endpoint."""
+    # Get user's followed whale IDs (if authenticated)
+    followed_whales = {}
+    if current_user:
+        follows_result = await db.execute(
+            select(UserWhaleFollow.whale_id, UserWhaleFollow.auto_copy_enabled).where(
+                UserWhaleFollow.user_id == current_user.id
+            )
         )
-    )
-    followed_whales = {row[0]: row[1] for row in follows_result.all()}
+        followed_whales = {row[0]: row[1] for row in follows_result.all()}
 
-    if not followed_whales and not whale_id:
-        # Return all public signals if user doesn't follow anyone
+    if whale_id:
+        # Filter by specific whale
+        query = select(WhaleSignal).where(WhaleSignal.whale_id == whale_id)
+    elif followed_whales:
+        # Filter by followed whales
+        query = select(WhaleSignal).where(WhaleSignal.whale_id.in_(list(followed_whales.keys())))
+    else:
+        # Return all public signals
         query = (
             select(WhaleSignal)
             .join(Whale)
             .where(Whale.is_public == True)
         )
-    else:
-        # Filter by followed whales or specific whale
-        whale_ids = [whale_id] if whale_id else list(followed_whales.keys())
-        query = select(WhaleSignal).where(WhaleSignal.whale_id.in_(whale_ids))
 
     # Time filter
     since = datetime.utcnow() - timedelta(hours=hours)
@@ -164,8 +168,8 @@ async def list_signals(
 @router.get("/{signal_id}", response_model=SignalResponse)
 async def get_signal(
     signal_id: int,
-    current_user: CurrentUser,
     db: DbSession,
+    current_user: OptionalUser = None,
 ) -> SignalResponse:
     """Get a specific signal's details."""
     result = await db.execute(

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, createContext, useContext } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   LayoutDashboard,
@@ -14,6 +14,16 @@ import WhaleDiscovery from './screens/WhaleDiscovery'
 import TradeHistory from './screens/TradeHistory'
 import LiveAlerts from './screens/LiveAlerts'
 import SettingsScreen from './screens/Settings'
+import { authApi } from './services/api'
+
+// Auth Context
+const AuthContext = createContext({
+  isAuthenticated: false,
+  user: null,
+  loading: true,
+})
+
+export const useAuth = () => useContext(AuthContext)
 
 const tabs = [
   { id: 'dashboard', icon: LayoutDashboard, label: 'Home' },
@@ -26,10 +36,58 @@ const tabs = [
 function App() {
   const [activeTab, setActiveTab] = useState('dashboard')
   const [isLoading, setIsLoading] = useState(true)
+  const [authState, setAuthState] = useState({
+    isAuthenticated: false,
+    user: null,
+    loading: true,
+  })
 
   useEffect(() => {
-    // Simulate initial loading
-    const timer = setTimeout(() => setIsLoading(false), 1500)
+    const initAuth = async () => {
+      try {
+        // First check if we already have a valid token
+        const authCheck = await authApi.checkAuth()
+
+        if (authCheck.authenticated && authCheck.user) {
+          setAuthState({
+            isAuthenticated: true,
+            user: authCheck.user,
+            loading: false,
+          })
+        } else {
+          // Try auto-auth with Telegram
+          const authResult = await authApi.autoAuth()
+
+          if (authResult?.user) {
+            setAuthState({
+              isAuthenticated: true,
+              user: authResult.user,
+              loading: false,
+            })
+          } else {
+            // Not authenticated, but that's OK - show demo mode
+            setAuthState({
+              isAuthenticated: false,
+              user: null,
+              loading: false,
+            })
+          }
+        }
+      } catch (error) {
+        console.error('Auth initialization error:', error)
+        setAuthState({
+          isAuthenticated: false,
+          user: null,
+          loading: false,
+        })
+      }
+
+      // Finish loading screen
+      setIsLoading(false)
+    }
+
+    // Small delay for loading animation
+    const timer = setTimeout(initAuth, 1000)
     return () => clearTimeout(timer)
   }, [])
 
@@ -55,6 +113,7 @@ function App() {
   }
 
   return (
+    <AuthContext.Provider value={authState}>
     <div className="min-h-screen flex flex-col relative">
       {/* Animated Ocean Background */}
       <div className="ocean-bg" />
@@ -165,6 +224,7 @@ function App() {
         </div>
       </nav>
     </div>
+    </AuthContext.Provider>
   )
 }
 

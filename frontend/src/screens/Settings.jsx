@@ -78,8 +78,8 @@ const exchangeInfo = {
 }
 
 function SettingsScreen() {
-  const { user, settings, loading, error, updateSettings } = useUser()
-  const { keys: apiKeys, loading: keysLoading, addKey, deleteKey } = useApiKeys()
+  const { user, settings, loading, error, updateSettings, isDemo } = useUser()
+  const { keys: apiKeys, loading: keysLoading, addKey, deleteKey, isDemo: keysDemo } = useApiKeys()
 
   const [localSettings, setLocalSettings] = useState({
     trading_mode: 'spot',

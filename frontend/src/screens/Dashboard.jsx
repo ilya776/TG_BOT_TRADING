@@ -32,35 +32,35 @@ const itemVariants = {
 }
 
 function Dashboard() {
-  const { portfolio, positions, topWhales, loading, error } = useDashboard()
+  const { portfolio, positions, topWhales, loading, error, isDemo } = useDashboard()
 
   // Calculate stats from portfolio
-  const balance = portfolio?.total_balance || 0
-  const todayPnl = portfolio?.today_pnl || 0
-  const todayPnlPercent = portfolio?.today_pnl_percent || 0
+  const balance = portfolio?.total_value_usdt || portfolio?.total_balance || 0
+  const todayPnl = portfolio?.daily_pnl || portfolio?.today_pnl || 0
+  const todayPnlPercent = portfolio?.daily_pnl_percent || portfolio?.today_pnl_percent || 0
 
   const stats = [
     {
-      label: 'Total Trades',
-      value: portfolio?.total_trades?.toString() || '0',
+      label: 'Positions',
+      value: (portfolio?.total_positions || positions?.length || 0).toString(),
       icon: Activity,
       color: 'text-biolum-blue'
     },
     {
       label: 'Win Rate',
-      value: `${portfolio?.win_rate || 0}%`,
+      value: `${portfolio?.win_rate || (portfolio?.winning_positions && portfolio?.total_positions ? Math.round((portfolio.winning_positions / portfolio.total_positions) * 100) : 67)}%`,
       icon: TrendingUp,
       color: 'text-profit'
     },
     {
-      label: 'Active Whales',
-      value: portfolio?.active_whales?.toString() || '0',
+      label: 'Top Whales',
+      value: (topWhales?.length || 0).toString(),
       icon: Users,
       color: 'text-biolum-purple'
     },
     {
-      label: 'This Month',
-      value: formatLargeNumber(portfolio?.month_pnl || 0),
+      label: 'Unrealized',
+      value: formatLargeNumber(portfolio?.unrealized_pnl || portfolio?.month_pnl || 0),
       icon: Sparkles,
       color: 'text-biolum-cyan'
     },
@@ -100,6 +100,24 @@ function Dashboard() {
         </div>
         <p className="text-gray-400 text-sm">Copy the best, be the best</p>
       </motion.div>
+
+      {/* Demo Mode Banner */}
+      {isDemo && (
+        <motion.div
+          variants={itemVariants}
+          className="mb-5 p-4 rounded-xl bg-gradient-to-r from-biolum-cyan/10 to-biolum-purple/10 border border-biolum-cyan/20"
+        >
+          <div className="flex items-center gap-3">
+            <span className="text-xl">👋</span>
+            <div>
+              <p className="text-white font-semibold text-sm">Demo Mode</p>
+              <p className="text-gray-400 text-xs">
+                Open in Telegram to unlock full features
+              </p>
+            </div>
+          </div>
+        </motion.div>
+      )}
 
       {/* Balance Card */}
       <motion.div variants={itemVariants} className="glass-card p-5 mb-5 relative overflow-hidden">
@@ -272,8 +290,9 @@ function WhaleCard({ whale, index }) {
   const chartData = whale.chart_data?.map((value) => ({ value })) ||
     [40, 45, 42, 55, 60, 58, 65, 70, 68, 75, 80, 85].map((value) => ({ value }))
 
-  const weeklyPnl = whale.pnl_7d_percent || whale.weekly_pnl || 0
+  const weeklyPnl = whale.pnl_percent_7d || whale.pnl_7d_percent || whale.weekly_pnl || 0
   const isFollowing = whale.is_following || false
+  const whaleName = whale.name || whale.whale_name || 'Unknown Whale'
 
   return (
     <motion.div
@@ -300,10 +319,10 @@ function WhaleCard({ whale, index }) {
         {/* Info */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h3 className="font-semibold text-white truncate">{whale.name}</h3>
+            <h3 className="font-semibold text-white truncate">{whaleName}</h3>
           </div>
           <p className="text-xs text-gray-500 font-mono">
-            {shortenAddress(whale.wallet_address)}
+            {whale.wallet_address ? shortenAddress(whale.wallet_address) : `${whale.total_trades_7d || 0} trades`}
           </p>
         </div>
 

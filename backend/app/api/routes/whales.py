@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
-from app.api.deps import CurrentUser, DbSession, ProUser
+from app.api.deps import CurrentUser, DbSession, OptionalUser, ProUser
 from app.config import SUBSCRIPTION_TIERS
 from app.models.whale import (
     UserWhaleFollow,
@@ -101,8 +101,8 @@ class UpdateFollowRequest(BaseModel):
 
 @router.get("", response_model=list[WhaleWithStatsResponse])
 async def list_whales(
-    current_user: CurrentUser,
     db: DbSession,
+    current_user: OptionalUser = None,
     chain: WhaleChain | None = None,
     rank: WhaleRank | None = None,
     search: str | None = None,
@@ -110,7 +110,7 @@ async def list_whales(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ) -> list[WhaleWithStatsResponse]:
-    """List available whales with optional filtering."""
+    """List available whales with optional filtering. Public endpoint."""
     query = select(Whale).where(Whale.is_active == True, Whale.is_public == True)
 
     if chain:
@@ -138,13 +138,15 @@ async def list_whales(
     result = await db.execute(query)
     whales = result.scalars().all()
 
-    # Get user's followed whales
-    follows_result = await db.execute(
-        select(UserWhaleFollow.whale_id).where(
-            UserWhaleFollow.user_id == current_user.id
+    # Get user's followed whales (if authenticated)
+    followed_ids = set()
+    if current_user:
+        follows_result = await db.execute(
+            select(UserWhaleFollow.whale_id).where(
+                UserWhaleFollow.user_id == current_user.id
+            )
         )
-    )
-    followed_ids = {row[0] for row in follows_result.all()}
+        followed_ids = {row[0] for row in follows_result.all()}
 
     # Get followers count for each whale
     followers_query = await db.execute(
@@ -189,12 +191,12 @@ async def list_whales(
 
 @router.get("/leaderboard", response_model=list[WhaleWithStatsResponse])
 async def get_whale_leaderboard(
-    current_user: CurrentUser,
     db: DbSession,
+    current_user: OptionalUser = None,
     period: str = Query("7d", enum=["7d", "30d", "90d", "all"]),
     limit: int = Query(10, ge=1, le=50),
 ) -> list[WhaleWithStatsResponse]:
-    """Get top performing whales."""
+    """Get top performing whales. Public endpoint."""
     profit_field = {
         "7d": WhaleStats.profit_7d,
         "30d": WhaleStats.profit_30d,
@@ -213,13 +215,15 @@ async def get_whale_leaderboard(
     result = await db.execute(query)
     whales = result.scalars().all()
 
-    # Get user's followed whales
-    follows_result = await db.execute(
-        select(UserWhaleFollow.whale_id).where(
-            UserWhaleFollow.user_id == current_user.id
+    # Get user's followed whales (if authenticated)
+    followed_ids = set()
+    if current_user:
+        follows_result = await db.execute(
+            select(UserWhaleFollow.whale_id).where(
+                UserWhaleFollow.user_id == current_user.id
+            )
         )
-    )
-    followed_ids = {row[0] for row in follows_result.all()}
+        followed_ids = {row[0] for row in follows_result.all()}
 
     responses = []
     for whale in whales:
@@ -252,10 +256,10 @@ async def get_whale_leaderboard(
 @router.get("/{whale_id}", response_model=WhaleWithStatsResponse)
 async def get_whale(
     whale_id: int,
-    current_user: CurrentUser,
     db: DbSession,
+    current_user: OptionalUser = None,
 ) -> WhaleWithStatsResponse:
-    """Get a specific whale's details."""
+    """Get a specific whale's details. Public endpoint."""
     result = await db.execute(select(Whale).where(Whale.id == whale_id))
     whale = result.scalar_one_or_none()
 
@@ -271,14 +275,16 @@ async def get_whale(
     )
     stats = stats_result.scalar_one_or_none()
 
-    # Check if following
-    follow_result = await db.execute(
-        select(UserWhaleFollow).where(
-            UserWhaleFollow.user_id == current_user.id,
-            UserWhaleFollow.whale_id == whale_id,
+    # Check if following (if authenticated)
+    is_following = False
+    if current_user:
+        follow_result = await db.execute(
+            select(UserWhaleFollow).where(
+                UserWhaleFollow.user_id == current_user.id,
+                UserWhaleFollow.whale_id == whale_id,
+            )
         )
-    )
-    is_following = follow_result.scalar_one_or_none() is not None
+        is_following = follow_result.scalar_one_or_none() is not None
 
     # Get followers count
     followers_query = await db.execute(

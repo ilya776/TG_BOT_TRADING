@@ -3,7 +3,130 @@
  */
 
 import { useState, useEffect, useCallback } from 'react';
-import { userApi, whalesApi, tradesApi, signalsApi, SignalWebSocket } from '../services/api';
+import { userApi, whalesApi, tradesApi, signalsApi, SignalWebSocket, authApi } from '../services/api';
+
+// Demo data for unauthenticated users
+const DEMO_PORTFOLIO = {
+  total_value_usdt: 10000,
+  unrealized_pnl: 245.50,
+  unrealized_pnl_percent: 2.45,
+  daily_pnl: 125.30,
+  daily_pnl_percent: 1.25,
+  total_positions: 3,
+  winning_positions: 2,
+};
+
+const DEMO_POSITIONS = [
+  {
+    id: 1,
+    symbol: 'BTCUSDT',
+    side: 'LONG',
+    entry_price: 42500,
+    current_price: 43200,
+    size_usdt: 1000,
+    unrealized_pnl: 16.47,
+    unrealized_pnl_percent: 1.65,
+    whale_name: 'BlueWhale_01',
+    opened_at: new Date(Date.now() - 3600000).toISOString(),
+  },
+  {
+    id: 2,
+    symbol: 'ETHUSDT',
+    side: 'LONG',
+    entry_price: 2250,
+    current_price: 2310,
+    size_usdt: 500,
+    unrealized_pnl: 13.33,
+    unrealized_pnl_percent: 2.67,
+    whale_name: 'CryptoKing',
+    opened_at: new Date(Date.now() - 7200000).toISOString(),
+  },
+];
+
+const DEMO_WHALES = [
+  {
+    id: 1,
+    name: 'BlueWhale_01',
+    win_rate: 78.5,
+    pnl_7d: 15420,
+    pnl_percent_7d: 12.5,
+    total_trades_7d: 24,
+    avatar: null,
+    tier: 'ELITE',
+  },
+  {
+    id: 2,
+    name: 'CryptoKing',
+    win_rate: 72.3,
+    pnl_7d: 8930,
+    pnl_percent_7d: 8.2,
+    total_trades_7d: 18,
+    avatar: null,
+    tier: 'PRO',
+  },
+  {
+    id: 3,
+    name: 'DeepDiver',
+    win_rate: 68.9,
+    pnl_7d: 5670,
+    pnl_percent_7d: 6.8,
+    total_trades_7d: 32,
+    avatar: null,
+    tier: 'PRO',
+  },
+];
+
+const DEMO_TRADES = [
+  {
+    id: 1,
+    symbol: 'BTCUSDT',
+    side: 'BUY',
+    type: 'MARKET',
+    price: 42500,
+    size_usdt: 1000,
+    status: 'FILLED',
+    pnl: 165,
+    pnl_percent: 1.65,
+    whale_name: 'BlueWhale_01',
+    executed_at: new Date(Date.now() - 3600000).toISOString(),
+  },
+  {
+    id: 2,
+    symbol: 'ETHUSDT',
+    side: 'BUY',
+    type: 'MARKET',
+    price: 2250,
+    size_usdt: 500,
+    status: 'FILLED',
+    pnl: 45,
+    pnl_percent: 0.9,
+    whale_name: 'CryptoKing',
+    executed_at: new Date(Date.now() - 7200000).toISOString(),
+  },
+];
+
+const DEMO_SIGNALS = [
+  {
+    id: 1,
+    whale_name: 'BlueWhale_01',
+    symbol: 'BTCUSDT',
+    action: 'BUY',
+    price: 43500,
+    size_usdt: 5000,
+    created_at: new Date(Date.now() - 300000).toISOString(),
+    confidence: 'HIGH',
+  },
+  {
+    id: 2,
+    whale_name: 'CryptoKing',
+    symbol: 'SOLUSDT',
+    action: 'BUY',
+    price: 98.5,
+    size_usdt: 2500,
+    created_at: new Date(Date.now() - 600000).toISOString(),
+    confidence: 'MEDIUM',
+  },
+];
 
 // ==================== GENERIC HOOKS ====================
 
@@ -35,6 +158,27 @@ export function useFetch(fetchFn, deps = []) {
   return { data, loading, error, refetch };
 }
 
+// Demo user data
+const DEMO_USER = {
+  id: 0,
+  telegram_id: 0,
+  username: 'demo_user',
+  first_name: 'Demo',
+  last_name: 'User',
+  subscription_tier: 'FREE',
+};
+
+const DEMO_SETTINGS = {
+  trading_mode: 'SPOT',
+  preferred_exchange: 'BINANCE',
+  auto_copy_enabled: false,
+  stop_loss_percent: 10,
+  daily_loss_limit_usdt: 100,
+  max_open_positions: 5,
+  notify_whale_alerts: true,
+  notify_trade_executed: true,
+};
+
 // ==================== USER HOOKS ====================
 
 /**
@@ -45,9 +189,21 @@ export function useUser() {
   const [settings, setSettings] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [isDemo, setIsDemo] = useState(false);
 
   const fetchUser = useCallback(async () => {
     setLoading(true);
+
+    // Check if user is authenticated
+    if (!authApi.isAuthenticated()) {
+      setUser(DEMO_USER);
+      setSettings(DEMO_SETTINGS);
+      setIsDemo(true);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+
     try {
       const [profileData, settingsData] = await Promise.all([
         userApi.getProfile(),
@@ -55,15 +211,29 @@ export function useUser() {
       ]);
       setUser(profileData);
       setSettings(settingsData);
+      setIsDemo(false);
       setError(null);
     } catch (err) {
-      setError(err.message);
+      // Fallback to demo data on auth error
+      if (err.message?.includes('authorization') || err.message?.includes('401')) {
+        setUser(DEMO_USER);
+        setSettings(DEMO_SETTINGS);
+        setIsDemo(true);
+        setError(null);
+      } else {
+        setError(err.message);
+      }
     } finally {
       setLoading(false);
     }
   }, []);
 
   const updateSettings = useCallback(async (newSettings) => {
+    if (isDemo) {
+      // In demo mode, just update local state
+      setSettings(prev => ({ ...prev, ...newSettings }));
+      return { ...settings, ...newSettings };
+    }
     try {
       const updated = await userApi.updateSettings(newSettings);
       setSettings(updated);
@@ -71,13 +241,13 @@ export function useUser() {
     } catch (err) {
       throw err;
     }
-  }, []);
+  }, [isDemo, settings]);
 
   useEffect(() => {
     fetchUser();
   }, [fetchUser]);
 
-  return { user, settings, loading, error, refetch: fetchUser, updateSettings };
+  return { user, settings, loading, error, isDemo, refetch: fetchUser, updateSettings };
 }
 
 /**
@@ -94,36 +264,61 @@ export function useApiKeys() {
   const [keys, setKeys] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [isDemo, setIsDemo] = useState(false);
 
   const fetchKeys = useCallback(async () => {
     setLoading(true);
+
+    // Check if user is authenticated
+    if (!authApi.isAuthenticated()) {
+      setKeys([]);
+      setIsDemo(true);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+
     try {
       const data = await userApi.getApiKeys();
       setKeys(data);
+      setIsDemo(false);
       setError(null);
     } catch (err) {
-      setError(err.message);
+      // On auth error, just show empty keys
+      if (err.message?.includes('authorization') || err.message?.includes('401')) {
+        setKeys([]);
+        setIsDemo(true);
+        setError(null);
+      } else {
+        setError(err.message);
+      }
     } finally {
       setLoading(false);
     }
   }, []);
 
   const addKey = useCallback(async (keyData) => {
+    if (isDemo) {
+      throw new Error('Please open in Telegram to add API keys');
+    }
     const newKey = await userApi.addApiKey(keyData);
     setKeys((prev) => [...prev, newKey]);
     return newKey;
-  }, []);
+  }, [isDemo]);
 
   const deleteKey = useCallback(async (keyId) => {
+    if (isDemo) {
+      throw new Error('Please open in Telegram to manage API keys');
+    }
     await userApi.deleteApiKey(keyId);
     setKeys((prev) => prev.filter((k) => k.id !== keyId));
-  }, []);
+  }, [isDemo]);
 
   useEffect(() => {
     fetchKeys();
   }, [fetchKeys]);
 
-  return { keys, loading, error, refetch: fetchKeys, addKey, deleteKey };
+  return { keys, loading, error, isDemo, refetch: fetchKeys, addKey, deleteKey };
 }
 
 // ==================== WHALE HOOKS ====================
@@ -361,6 +556,7 @@ export function useLiveSignals() {
 
 /**
  * Hook for dashboard data (combines multiple API calls)
+ * Returns demo data if user is not authenticated
  */
 export function useDashboard() {
   const [data, setData] = useState({
@@ -371,26 +567,53 @@ export function useDashboard() {
   });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [isDemo, setIsDemo] = useState(false);
 
   const fetchDashboard = useCallback(async () => {
     setLoading(true);
-    try {
-      const [portfolio, positions, whales, trades] = await Promise.all([
-        tradesApi.getPortfolio(),
-        tradesApi.getPositions(),
-        whalesApi.getLeaderboard('7d'),
-        tradesApi.getTrades({ limit: 5 }),
-      ]);
 
-      setData({
-        portfolio,
-        positions,
-        topWhales: whales.slice(0, 3),
-        recentTrades: trades.items || trades,
-      });
+    const isAuthenticated = authApi.isAuthenticated();
+
+    try {
+      // Whales leaderboard is public - always fetch real data
+      const whales = await whalesApi.getLeaderboard('7d').catch(() => DEMO_WHALES);
+
+      if (isAuthenticated) {
+        // Authenticated: fetch all user-specific data
+        const [portfolio, positions, trades] = await Promise.all([
+          tradesApi.getPortfolio().catch(() => DEMO_PORTFOLIO),
+          tradesApi.getPositions().catch(() => []),
+          tradesApi.getTrades({ limit: 5 }).catch(() => []),
+        ]);
+
+        setData({
+          portfolio,
+          positions,
+          topWhales: whales.slice ? whales.slice(0, 3) : whales,
+          recentTrades: trades.items || trades,
+        });
+        setIsDemo(false);
+      } else {
+        // Not authenticated: show real whales, demo portfolio/positions
+        setData({
+          portfolio: DEMO_PORTFOLIO,
+          positions: DEMO_POSITIONS,
+          topWhales: whales.slice ? whales.slice(0, 3) : DEMO_WHALES,
+          recentTrades: DEMO_TRADES,
+        });
+        setIsDemo(true);
+      }
       setError(null);
     } catch (err) {
-      setError(err.message);
+      // Fallback to demo on any error
+      setData({
+        portfolio: DEMO_PORTFOLIO,
+        positions: DEMO_POSITIONS,
+        topWhales: DEMO_WHALES,
+        recentTrades: DEMO_TRADES,
+      });
+      setIsDemo(true);
+      setError(null);
     } finally {
       setLoading(false);
     }
@@ -406,5 +629,5 @@ export function useDashboard() {
     return () => clearInterval(interval);
   }, [fetchDashboard]);
 
-  return { ...data, loading, error, refetch: fetchDashboard };
+  return { ...data, loading, error, isDemo, refetch: fetchDashboard };
 }

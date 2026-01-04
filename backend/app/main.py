@@ -12,7 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import users, whales, trades, subscriptions, webhooks, signals
+from app.api.routes import auth, users, whales, trades, subscriptions, webhooks, signals
 from app.config import get_settings
 from app.database import close_db, init_db
 
@@ -139,6 +139,7 @@ async def general_exception_handler(
 
 
 # Include routers
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
 app.include_router(users.router, prefix="/api/v1/users", tags=["Users"])
 app.include_router(whales.router, prefix="/api/v1/whales", tags=["Whales"])
 app.include_router(trades.router, prefix="/api/v1/trades", tags=["Trades"])
