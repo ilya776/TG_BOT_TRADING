@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   Search,
@@ -11,151 +11,54 @@ import {
   Check,
   ChevronDown,
   Wallet,
-  X
+  X,
+  Loader2
 } from 'lucide-react'
 import { AreaChart, Area, ResponsiveContainer } from 'recharts'
+import { useWhales, useFollowingWhales } from '../hooks/useApi'
+import { formatCurrency, formatLargeNumber, shortenAddress } from '../services/api'
 
 const chains = [
   { id: 'all', name: 'All Chains', icon: '🌐' },
-  { id: 'eth', name: 'Ethereum', icon: '⟠' },
-  { id: 'bsc', name: 'BSC', icon: '🔶' },
-  { id: 'sol', name: 'Solana', icon: '◎' },
-  { id: 'arb', name: 'Arbitrum', icon: '🔵' },
+  { id: 'ETHEREUM', name: 'Ethereum', icon: '⟠' },
+  { id: 'BSC', name: 'BSC', icon: '🔶' },
 ]
 
 const sortOptions = [
-  { id: 'profit', name: 'Total Profit' },
-  { id: 'winrate', name: 'Win Rate' },
-  { id: 'weekly', name: '7D Performance' },
+  { id: 'score', name: 'Score' },
+  { id: 'win_rate', name: 'Win Rate' },
+  { id: 'pnl_7d', name: '7D Performance' },
   { id: 'followers', name: 'Most Followed' },
-]
-
-const mockWhales = [
-  {
-    id: 1,
-    name: 'DeFi Chad',
-    address: '0x742d35Cc6634C0532925a3b844Bc454e4438f44e',
-    avatar: '🐋',
-    chain: 'eth',
-    winRate: 73,
-    totalProfit: 2400000,
-    totalTrades: 847,
-    weeklyPnl: 12.5,
-    followers: 2341,
-    isFollowing: true,
-    isVerified: true,
-    tags: ['Memecoin King', 'Early Entry'],
-    chartData: [40, 45, 42, 55, 60, 58, 65, 70, 68, 75, 80, 85],
-    recentTrades: [
-      { token: 'PEPE', profit: 45000, time: '2h ago' },
-      { token: 'WIF', profit: 23000, time: '5h ago' },
-    ]
-  },
-  {
-    id: 2,
-    name: 'Whale Alpha',
-    address: '0x89ab78cdef0123456789abcdef0123456789abcd',
-    avatar: '🦈',
-    chain: 'eth',
-    winRate: 68,
-    totalProfit: 1800000,
-    totalTrades: 523,
-    weeklyPnl: 8.3,
-    followers: 1876,
-    isFollowing: false,
-    isVerified: true,
-    tags: ['DeFi Expert', 'Low Risk'],
-    chartData: [30, 35, 40, 38, 45, 50, 48, 55, 60, 58, 62, 65],
-    recentTrades: [
-      { token: 'ARB', profit: 12000, time: '1h ago' },
-      { token: 'OP', profit: -3500, time: '6h ago' },
-    ]
-  },
-  {
-    id: 3,
-    name: 'Smart Money',
-    address: '0xdef456789abcdef0123456789abcdef01234567',
-    avatar: '🐬',
-    chain: 'sol',
-    winRate: 71,
-    totalProfit: 3200000,
-    totalTrades: 1203,
-    weeklyPnl: 15.2,
-    followers: 4521,
-    isFollowing: false,
-    isVerified: true,
-    tags: ['SOL Native', 'High Volume'],
-    chartData: [50, 48, 55, 60, 58, 65, 70, 75, 72, 80, 85, 90],
-    recentTrades: [
-      { token: 'BONK', profit: 67000, time: '30m ago' },
-      { token: 'JUP', profit: 34000, time: '3h ago' },
-    ]
-  },
-  {
-    id: 4,
-    name: 'Degen King',
-    address: '0xabc123def456789abc123def456789abc123def4',
-    avatar: '👑',
-    chain: 'bsc',
-    winRate: 62,
-    totalProfit: 980000,
-    totalTrades: 2156,
-    weeklyPnl: -3.2,
-    followers: 3245,
-    isFollowing: false,
-    isVerified: false,
-    tags: ['High Risk', 'BSC Degen'],
-    chartData: [60, 65, 58, 55, 52, 58, 62, 55, 50, 48, 52, 55],
-    recentTrades: [
-      { token: 'CAKE', profit: -8000, time: '45m ago' },
-      { token: 'BNB', profit: 5600, time: '2h ago' },
-    ]
-  },
-  {
-    id: 5,
-    name: 'Silent Whale',
-    address: '0x999888777666555444333222111000aaabbbccc',
-    avatar: '🌊',
-    chain: 'arb',
-    winRate: 78,
-    totalProfit: 1450000,
-    totalTrades: 234,
-    weeklyPnl: 22.4,
-    followers: 987,
-    isFollowing: true,
-    isVerified: true,
-    tags: ['Arbitrum OG', 'Sniper'],
-    chartData: [40, 45, 50, 55, 60, 70, 75, 85, 90, 95, 100, 110],
-    recentTrades: [
-      { token: 'GMX', profit: 89000, time: '15m ago' },
-      { token: 'MAGIC', profit: 45000, time: '4h ago' },
-    ]
-  },
 ]
 
 function WhaleDiscovery() {
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedChain, setSelectedChain] = useState('all')
-  const [selectedSort, setSelectedSort] = useState('profit')
+  const [selectedSort, setSelectedSort] = useState('score')
   const [showFilters, setShowFilters] = useState(false)
   const [selectedWhale, setSelectedWhale] = useState(null)
 
-  const filteredWhales = mockWhales
-    .filter(whale => {
-      if (selectedChain !== 'all' && whale.chain !== selectedChain) return false
-      if (searchQuery && !whale.name.toLowerCase().includes(searchQuery.toLowerCase()) &&
-          !whale.address.toLowerCase().includes(searchQuery.toLowerCase())) return false
-      return true
-    })
-    .sort((a, b) => {
-      switch (selectedSort) {
-        case 'profit': return b.totalProfit - a.totalProfit
-        case 'winrate': return b.winRate - a.winRate
-        case 'weekly': return b.weeklyPnl - a.weeklyPnl
-        case 'followers': return b.followers - a.followers
-        default: return 0
-      }
-    })
+  const { whales, loading, error, refetch } = useWhales({
+    chain: selectedChain !== 'all' ? selectedChain : undefined,
+    sortBy: selectedSort,
+    search: searchQuery || undefined,
+  })
+
+  const { whales: followingWhales, followWhale, unfollowWhale, updateFollow } = useFollowingWhales()
+  const followedIds = new Set(followingWhales.map(w => w.whale_id))
+
+  const filteredWhales = whales.map(whale => ({
+    ...whale,
+    isFollowing: followedIds.has(whale.id)
+  }))
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <Loader2 className="w-8 h-8 text-biolum-cyan animate-spin" />
+      </div>
+    )
+  }
 
   return (
     <div className="px-4 pt-6 pb-4">
@@ -265,6 +168,23 @@ function WhaleDiscovery() {
         </p>
       </motion.div>
 
+      {/* Error State */}
+      {error && (
+        <div className="glass-card p-4 mb-4 text-center">
+          <p className="text-loss">{error}</p>
+          <button onClick={refetch} className="text-biolum-cyan text-sm mt-2">Try again</button>
+        </div>
+      )}
+
+      {/* Empty State */}
+      {!loading && filteredWhales.length === 0 && (
+        <div className="glass-card p-8 text-center">
+          <p className="text-2xl mb-2">🐋</p>
+          <p className="text-gray-400">No whales found</p>
+          <p className="text-gray-500 text-sm mt-1">Try adjusting your filters</p>
+        </div>
+      )}
+
       {/* Whale List */}
       <div className="space-y-3">
         {filteredWhales.map((whale, index) => (
@@ -273,6 +193,8 @@ function WhaleDiscovery() {
             whale={whale}
             index={index}
             onClick={() => setSelectedWhale(whale)}
+            onFollow={() => followWhale(whale.id)}
+            onUnfollow={() => unfollowWhale(whale.id)}
           />
         ))}
       </div>
@@ -283,6 +205,9 @@ function WhaleDiscovery() {
           <WhaleDetailModal
             whale={selectedWhale}
             onClose={() => setSelectedWhale(null)}
+            onFollow={() => followWhale(selectedWhale.id)}
+            onUnfollow={() => unfollowWhale(selectedWhale.id)}
+            onUpdateFollow={(settings) => updateFollow(selectedWhale.id, settings)}
           />
         )}
       </AnimatePresence>
@@ -290,10 +215,29 @@ function WhaleDiscovery() {
   )
 }
 
-function WhaleDiscoveryCard({ whale, index, onClick }) {
+function WhaleDiscoveryCard({ whale, index, onClick, onFollow, onUnfollow }) {
   const [isFollowing, setIsFollowing] = useState(whale.isFollowing)
-  const chartData = whale.chartData.map((value) => ({ value }))
-  const chainInfo = chains.find(c => c.id === whale.chain)
+  const chartData = whale.chart_data?.map((value) => ({ value })) ||
+    [40, 45, 42, 55, 60, 58, 65, 70, 68, 75, 80, 85].map(v => ({ value: v }))
+
+  const weeklyPnl = whale.stats?.pnl_7d_percent || whale.pnl_7d_percent || 0
+  const winRate = whale.stats?.win_rate || whale.win_rate || 0
+  const totalProfit = whale.stats?.total_pnl || whale.total_profit || 0
+  const followers = whale.followers_count || 0
+
+  const handleFollowClick = async (e) => {
+    e.stopPropagation()
+    try {
+      if (isFollowing) {
+        await onUnfollow()
+      } else {
+        await onFollow()
+      }
+      setIsFollowing(!isFollowing)
+    } catch (err) {
+      console.error('Follow error:', err)
+    }
+  }
 
   return (
     <motion.div
@@ -309,9 +253,9 @@ function WhaleDiscoveryCard({ whale, index, onClick }) {
           {/* Avatar */}
           <div className="relative">
             <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-biolum-cyan/20 to-biolum-purple/20 flex items-center justify-center text-3xl">
-              {whale.avatar}
+              🐋
             </div>
-            {whale.isVerified && (
+            {whale.is_verified && (
               <div className="absolute -top-1 -right-1 w-5 h-5 bg-biolum-blue rounded-full flex items-center justify-center">
                 <Check size={12} className="text-white" />
               </div>
@@ -323,14 +267,14 @@ function WhaleDiscoveryCard({ whale, index, onClick }) {
             <div className="flex items-center gap-2">
               <h3 className="font-semibold text-white">{whale.name}</h3>
               <span className="text-xs px-1.5 py-0.5 rounded bg-ocean-600/50 text-gray-400">
-                {chainInfo?.icon}
+                {whale.chain === 'ETHEREUM' ? '⟠' : '🔶'}
               </span>
             </div>
             <p className="text-xs text-gray-500 font-mono">
-              {whale.address.slice(0, 6)}...{whale.address.slice(-4)}
+              {shortenAddress(whale.wallet_address)}
             </p>
             <div className="flex gap-1 mt-1">
-              {whale.tags.slice(0, 2).map((tag) => (
+              {whale.tags?.slice(0, 2).map((tag) => (
                 <span
                   key={tag}
                   className="text-[10px] px-1.5 py-0.5 rounded-full bg-biolum-purple/10 text-biolum-purple"
@@ -344,10 +288,7 @@ function WhaleDiscoveryCard({ whale, index, onClick }) {
 
         {/* Follow Button */}
         <button
-          onClick={(e) => {
-            e.stopPropagation()
-            setIsFollowing(!isFollowing)
-          }}
+          onClick={handleFollowClick}
           className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
             isFollowing
               ? 'bg-profit/20 text-profit border border-profit/30'
@@ -363,18 +304,18 @@ function WhaleDiscoveryCard({ whale, index, onClick }) {
         <div className="flex items-center gap-4">
           <div>
             <p className="text-[10px] text-gray-500 uppercase tracking-wide">Win Rate</p>
-            <p className="font-mono font-semibold text-profit">{whale.winRate}%</p>
+            <p className="font-mono font-semibold text-profit">{winRate.toFixed(1)}%</p>
           </div>
           <div>
             <p className="text-[10px] text-gray-500 uppercase tracking-wide">Total Profit</p>
             <p className="font-mono font-semibold text-white">
-              ${(whale.totalProfit / 1000000).toFixed(1)}M
+              {formatLargeNumber(totalProfit)}
             </p>
           </div>
           <div>
             <p className="text-[10px] text-gray-500 uppercase tracking-wide">Followers</p>
             <p className="font-mono font-semibold text-gray-300">
-              {whale.followers.toLocaleString()}
+              {followers.toLocaleString()}
             </p>
           </div>
         </div>
@@ -386,14 +327,14 @@ function WhaleDiscoveryCard({ whale, index, onClick }) {
               <AreaChart data={chartData}>
                 <defs>
                   <linearGradient id={`discovery-gradient-${whale.id}`} x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={whale.weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'} stopOpacity={0.3} />
-                    <stop offset="100%" stopColor={whale.weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'} stopOpacity={0} />
+                    <stop offset="0%" stopColor={weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'} stopOpacity={0.3} />
+                    <stop offset="100%" stopColor={weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'} stopOpacity={0} />
                   </linearGradient>
                 </defs>
                 <Area
                   type="monotone"
                   dataKey="value"
-                  stroke={whale.weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'}
+                  stroke={weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'}
                   strokeWidth={1.5}
                   fill={`url(#discovery-gradient-${whale.id})`}
                 />
@@ -403,9 +344,9 @@ function WhaleDiscoveryCard({ whale, index, onClick }) {
           <div className="text-right">
             <p className="text-[10px] text-gray-500">7D</p>
             <p className={`font-mono font-semibold ${
-              whale.weeklyPnl >= 0 ? 'text-profit' : 'text-loss'
+              weeklyPnl >= 0 ? 'text-profit' : 'text-loss'
             }`}>
-              {whale.weeklyPnl >= 0 ? '+' : ''}{whale.weeklyPnl}%
+              {weeklyPnl >= 0 ? '+' : ''}{weeklyPnl.toFixed(1)}%
             </p>
           </div>
         </div>
@@ -414,15 +355,54 @@ function WhaleDiscoveryCard({ whale, index, onClick }) {
   )
 }
 
-function WhaleDetailModal({ whale, onClose }) {
+function WhaleDetailModal({ whale, onClose, onFollow, onUnfollow, onUpdateFollow }) {
   const [isFollowing, setIsFollowing] = useState(whale.isFollowing)
   const [copySettings, setCopySettings] = useState({
     tradeSize: 100,
-    autoCopy: true,
+    autoCopy: false,
     maxLoss: 10,
   })
+  const [isLoading, setIsLoading] = useState(false)
 
-  const chartData = whale.chartData.map((value) => ({ value }))
+  const chartData = whale.chart_data?.map((value) => ({ value })) ||
+    [40, 45, 42, 55, 60, 58, 65, 70, 68, 75, 80, 85].map(v => ({ value: v }))
+
+  const weeklyPnl = whale.stats?.pnl_7d_percent || whale.pnl_7d_percent || 0
+  const winRate = whale.stats?.win_rate || whale.win_rate || 0
+  const totalProfit = whale.stats?.total_pnl || whale.total_profit || 0
+  const totalTrades = whale.stats?.total_trades || whale.total_trades || 0
+  const followers = whale.followers_count || 0
+
+  const handleAction = async () => {
+    setIsLoading(true)
+    try {
+      if (isFollowing) {
+        await onUnfollow()
+      } else {
+        await onFollow()
+      }
+      setIsFollowing(!isFollowing)
+    } catch (err) {
+      console.error('Action error:', err)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleSettingsChange = async (key, value) => {
+    const newSettings = { ...copySettings, [key]: value }
+    setCopySettings(newSettings)
+    if (isFollowing) {
+      try {
+        await onUpdateFollow({
+          auto_copy_enabled: newSettings.autoCopy,
+          trade_size_usdt: newSettings.tradeSize,
+        })
+      } catch (err) {
+        console.error('Update settings error:', err)
+      }
+    }
+  }
 
   return (
     <motion.div
@@ -465,9 +445,9 @@ function WhaleDetailModal({ whale, onClose }) {
           <div className="flex items-center gap-4 mb-6">
             <div className="relative">
               <div className="w-20 h-20 rounded-3xl bg-gradient-to-br from-biolum-cyan/20 to-biolum-purple/20 flex items-center justify-center text-5xl">
-                {whale.avatar}
+                🐋
               </div>
-              {whale.isVerified && (
+              {whale.is_verified && (
                 <div className="absolute -bottom-1 -right-1 w-7 h-7 bg-biolum-blue rounded-full flex items-center justify-center">
                   <Check size={16} className="text-white" />
                 </div>
@@ -478,10 +458,10 @@ function WhaleDetailModal({ whale, onClose }) {
               <h2 className="font-display text-2xl font-bold text-white">{whale.name}</h2>
               <p className="text-sm text-gray-500 font-mono flex items-center gap-2">
                 <Wallet size={14} />
-                {whale.address.slice(0, 10)}...{whale.address.slice(-6)}
+                {shortenAddress(whale.wallet_address)}
               </p>
               <div className="flex gap-2 mt-2">
-                {whale.tags.map((tag) => (
+                {whale.tags?.map((tag) => (
                   <span
                     key={tag}
                     className="text-xs px-2 py-1 rounded-full bg-biolum-purple/10 text-biolum-purple"
@@ -498,9 +478,9 @@ function WhaleDetailModal({ whale, onClose }) {
             <div className="flex items-center justify-between mb-3">
               <p className="text-sm text-gray-400">7 Day Performance</p>
               <p className={`font-mono font-bold ${
-                whale.weeklyPnl >= 0 ? 'text-profit' : 'text-loss'
+                weeklyPnl >= 0 ? 'text-profit' : 'text-loss'
               }`}>
-                {whale.weeklyPnl >= 0 ? '+' : ''}{whale.weeklyPnl}%
+                {weeklyPnl >= 0 ? '+' : ''}{weeklyPnl.toFixed(1)}%
               </p>
             </div>
             <div className="h-32">
@@ -508,14 +488,14 @@ function WhaleDetailModal({ whale, onClose }) {
                 <AreaChart data={chartData}>
                   <defs>
                     <linearGradient id="modal-gradient" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor={whale.weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'} stopOpacity={0.4} />
-                      <stop offset="100%" stopColor={whale.weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'} stopOpacity={0} />
+                      <stop offset="0%" stopColor={weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'} stopOpacity={0.4} />
+                      <stop offset="100%" stopColor={weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'} stopOpacity={0} />
                     </linearGradient>
                   </defs>
                   <Area
                     type="monotone"
                     dataKey="value"
-                    stroke={whale.weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'}
+                    stroke={weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'}
                     strokeWidth={2}
                     fill="url(#modal-gradient)"
                   />
@@ -528,53 +508,25 @@ function WhaleDetailModal({ whale, onClose }) {
           <div className="grid grid-cols-2 gap-3 mb-4">
             <div className="glass-card p-4">
               <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">Win Rate</p>
-              <p className="font-display text-2xl font-bold text-profit">{whale.winRate}%</p>
+              <p className="font-display text-2xl font-bold text-profit">{winRate.toFixed(1)}%</p>
             </div>
             <div className="glass-card p-4">
               <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">Total Profit</p>
               <p className="font-display text-2xl font-bold text-white">
-                ${(whale.totalProfit / 1000000).toFixed(2)}M
+                {formatLargeNumber(totalProfit)}
               </p>
             </div>
             <div className="glass-card p-4">
               <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">Total Trades</p>
               <p className="font-display text-2xl font-bold text-gray-300">
-                {whale.totalTrades.toLocaleString()}
+                {totalTrades.toLocaleString()}
               </p>
             </div>
             <div className="glass-card p-4">
               <p className="text-xs text-gray-500 uppercase tracking-wide mb-1">Followers</p>
               <p className="font-display text-2xl font-bold text-biolum-blue">
-                {whale.followers.toLocaleString()}
+                {followers.toLocaleString()}
               </p>
-            </div>
-          </div>
-
-          {/* Recent Trades */}
-          <div className="glass-card p-4 mb-6">
-            <p className="text-sm text-gray-400 mb-3">Recent Trades</p>
-            <div className="space-y-2">
-              {whale.recentTrades.map((trade, index) => (
-                <div
-                  key={index}
-                  className="flex items-center justify-between py-2 border-b border-ocean-600/50 last:border-0"
-                >
-                  <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-lg bg-ocean-600 flex items-center justify-center font-mono text-xs font-bold">
-                      {trade.token.slice(0, 2)}
-                    </div>
-                    <div>
-                      <p className="font-semibold text-white">{trade.token}</p>
-                      <p className="text-xs text-gray-500">{trade.time}</p>
-                    </div>
-                  </div>
-                  <p className={`font-mono font-semibold ${
-                    trade.profit >= 0 ? 'text-profit' : 'text-loss'
-                  }`}>
-                    {trade.profit >= 0 ? '+' : ''}${Math.abs(trade.profit).toLocaleString()}
-                  </p>
-                </div>
-              ))}
             </div>
           </div>
 
@@ -599,7 +551,7 @@ function WhaleDetailModal({ whale, onClose }) {
                     max="1000"
                     step="10"
                     value={copySettings.tradeSize}
-                    onChange={(e) => setCopySettings({ ...copySettings, tradeSize: Number(e.target.value) })}
+                    onChange={(e) => handleSettingsChange('tradeSize', Number(e.target.value))}
                     className="w-full accent-biolum-cyan"
                   />
                 </div>
@@ -607,7 +559,7 @@ function WhaleDetailModal({ whale, onClose }) {
                 <div className="flex items-center justify-between">
                   <label className="text-sm text-white">Auto-Copy</label>
                   <button
-                    onClick={() => setCopySettings({ ...copySettings, autoCopy: !copySettings.autoCopy })}
+                    onClick={() => handleSettingsChange('autoCopy', !copySettings.autoCopy)}
                     className={`w-12 h-6 rounded-full transition-colors ${
                       copySettings.autoCopy ? 'bg-biolum-cyan' : 'bg-ocean-600'
                     }`}
@@ -625,14 +577,21 @@ function WhaleDetailModal({ whale, onClose }) {
 
           {/* Action Button */}
           <button
-            onClick={() => setIsFollowing(!isFollowing)}
+            onClick={handleAction}
+            disabled={isLoading}
             className={`w-full py-4 rounded-2xl font-semibold text-lg transition-all ${
               isFollowing
                 ? 'bg-ocean-600 text-white border border-ocean-500'
                 : 'btn-primary'
             }`}
           >
-            {isFollowing ? 'Stop Following' : 'Start Copying'}
+            {isLoading ? (
+              <Loader2 className="w-5 h-5 animate-spin mx-auto" />
+            ) : isFollowing ? (
+              'Stop Following'
+            ) : (
+              'Start Copying'
+            )}
           </button>
         </div>
       </motion.div>

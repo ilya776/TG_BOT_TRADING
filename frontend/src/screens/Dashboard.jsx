@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React from 'react'
 import { motion } from 'framer-motion'
 import {
   TrendingUp,
@@ -9,85 +9,12 @@ import {
   ArrowUpRight,
   ArrowDownRight,
   ChevronRight,
-  Sparkles
+  Sparkles,
+  Loader2
 } from 'lucide-react'
 import { AreaChart, Area, ResponsiveContainer } from 'recharts'
-
-// Mock data
-const mockPositions = [
-  {
-    id: 1,
-    symbol: 'PEPE',
-    name: 'Pepe',
-    side: 'LONG',
-    entry: 0.00001234,
-    current: 0.00001456,
-    size: 150,
-    pnl: 27.35,
-    pnlPercent: 18.23,
-    whale: 'DeFi Chad',
-  },
-  {
-    id: 2,
-    symbol: 'ARB',
-    name: 'Arbitrum',
-    side: 'LONG',
-    entry: 1.24,
-    current: 1.18,
-    size: 200,
-    pnl: -9.68,
-    pnlPercent: -4.84,
-    whale: 'Whale Alpha',
-  },
-  {
-    id: 3,
-    symbol: 'SOL',
-    name: 'Solana',
-    side: 'LONG',
-    entry: 98.50,
-    current: 105.20,
-    size: 300,
-    pnl: 20.41,
-    pnlPercent: 6.80,
-    whale: 'Smart Money',
-  },
-]
-
-const mockWhales = [
-  {
-    id: 1,
-    name: 'DeFi Chad',
-    address: '0x742d35Cc6634C0532925a3b844Bc454e4438f44e',
-    avatar: '🐋',
-    winRate: 73,
-    totalProfit: 2400000,
-    weeklyPnl: 12.5,
-    isFollowing: true,
-    chartData: [40, 45, 42, 55, 60, 58, 65, 70, 68, 75, 80, 85],
-  },
-  {
-    id: 2,
-    name: 'Whale Alpha',
-    address: '0x89ab78cdef0123456789abcdef0123456789abcd',
-    avatar: '🦈',
-    winRate: 68,
-    totalProfit: 1800000,
-    weeklyPnl: 8.3,
-    isFollowing: true,
-    chartData: [30, 35, 40, 38, 45, 50, 48, 55, 60, 58, 62, 65],
-  },
-  {
-    id: 3,
-    name: 'Smart Money',
-    address: '0xdef456789abcdef0123456789abcdef01234567',
-    avatar: '🐬',
-    winRate: 71,
-    totalProfit: 3200000,
-    weeklyPnl: 15.2,
-    isFollowing: false,
-    chartData: [50, 48, 55, 60, 58, 65, 70, 75, 72, 80, 85, 90],
-  },
-]
+import { useDashboard } from '../hooks/useApi'
+import { formatCurrency, formatPercent, formatLargeNumber, shortenAddress } from '../services/api'
 
 const containerVariants = {
   hidden: { opacity: 0 },
@@ -105,16 +32,58 @@ const itemVariants = {
 }
 
 function Dashboard() {
-  const [balance, setBalance] = useState(12847.53)
-  const [todayPnl, setTodayPnl] = useState(387.24)
-  const [todayPnlPercent, setTodayPnlPercent] = useState(3.11)
+  const { portfolio, positions, topWhales, loading, error } = useDashboard()
+
+  // Calculate stats from portfolio
+  const balance = portfolio?.total_balance || 0
+  const todayPnl = portfolio?.today_pnl || 0
+  const todayPnlPercent = portfolio?.today_pnl_percent || 0
 
   const stats = [
-    { label: 'Total Trades', value: '247', icon: Activity, color: 'text-biolum-blue' },
-    { label: 'Win Rate', value: '68%', icon: TrendingUp, color: 'text-profit' },
-    { label: 'Active Whales', value: '5', icon: Users, color: 'text-biolum-purple' },
-    { label: 'This Month', value: '+$2.4K', icon: Sparkles, color: 'text-biolum-cyan' },
+    {
+      label: 'Total Trades',
+      value: portfolio?.total_trades?.toString() || '0',
+      icon: Activity,
+      color: 'text-biolum-blue'
+    },
+    {
+      label: 'Win Rate',
+      value: `${portfolio?.win_rate || 0}%`,
+      icon: TrendingUp,
+      color: 'text-profit'
+    },
+    {
+      label: 'Active Whales',
+      value: portfolio?.active_whales?.toString() || '0',
+      icon: Users,
+      color: 'text-biolum-purple'
+    },
+    {
+      label: 'This Month',
+      value: formatLargeNumber(portfolio?.month_pnl || 0),
+      icon: Sparkles,
+      color: 'text-biolum-cyan'
+    },
   ]
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <Loader2 className="w-8 h-8 text-biolum-cyan animate-spin" />
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="px-4 pt-6">
+        <div className="glass-card p-4 text-center">
+          <p className="text-loss">Failed to load dashboard</p>
+          <p className="text-gray-500 text-sm mt-2">{error}</p>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <motion.div
@@ -147,7 +116,7 @@ function Dashboard() {
               animate={{ opacity: 1, scale: 1 }}
               transition={{ duration: 0.5, delay: 0.2 }}
             >
-              ${balance.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+              {formatCurrency(balance)}
             </motion.span>
           </div>
 
@@ -163,12 +132,12 @@ function Dashboard() {
               <span className={`font-mono text-sm font-semibold ${
                 todayPnl >= 0 ? 'text-profit' : 'text-loss'
               }`}>
-                {todayPnl >= 0 ? '+' : ''}${Math.abs(todayPnl).toFixed(2)}
+                {todayPnl >= 0 ? '+' : ''}{formatCurrency(todayPnl)}
               </span>
               <span className={`font-mono text-sm ${
                 todayPnl >= 0 ? 'text-profit/70' : 'text-loss/70'
               }`}>
-                ({todayPnl >= 0 ? '+' : ''}{todayPnlPercent.toFixed(2)}%)
+                ({formatPercent(todayPnlPercent)})
               </span>
             </div>
             <span className="text-gray-500 text-xs">Today</span>
@@ -178,7 +147,7 @@ function Dashboard() {
 
       {/* Quick Stats Grid */}
       <motion.div variants={itemVariants} className="grid grid-cols-2 gap-3 mb-5">
-        {stats.map((stat, index) => {
+        {stats.map((stat) => {
           const Icon = stat.icon
           return (
             <div
@@ -209,56 +178,65 @@ function Dashboard() {
           </button>
         </div>
 
-        <div className="space-y-3">
-          {mockPositions.map((position, index) => (
-            <motion.div
-              key={position.id}
-              className="glass-card-hover p-4"
-              initial={{ opacity: 0, x: -20 }}
-              animate={{ opacity: 1, x: 0 }}
-              transition={{ delay: 0.1 * index }}
-            >
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-ocean-600 to-ocean-700 flex items-center justify-center font-display font-bold text-sm text-white">
-                    {position.symbol.slice(0, 2)}
+        {positions.length === 0 ? (
+          <div className="glass-card p-6 text-center">
+            <p className="text-gray-500">No active positions</p>
+            <p className="text-gray-600 text-sm mt-1">Follow a whale to start copy trading</p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {positions.slice(0, 3).map((position, index) => (
+              <motion.div
+                key={position.id}
+                className="glass-card-hover p-4"
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ delay: 0.1 * index }}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-ocean-600 to-ocean-700 flex items-center justify-center font-display font-bold text-sm text-white">
+                      {position.symbol?.slice(0, 2) || '??'}
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-white">{position.symbol}</span>
+                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                          position.side === 'BUY' ? 'bg-profit/20 text-profit' : 'bg-loss/20 text-loss'
+                        }`}>
+                          {position.side === 'BUY' ? 'LONG' : 'SHORT'}
+                        </span>
+                      </div>
+                      <p className="text-xs text-gray-500">
+                        via {position.whale_name || 'Whale'}
+                      </p>
+                    </div>
                   </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-semibold text-white">{position.symbol}</span>
-                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
-                        position.side === 'LONG' ? 'bg-profit/20 text-profit' : 'bg-loss/20 text-loss'
-                      }`}>
-                        {position.side}
+
+                  <div className="text-right">
+                    <div className={`flex items-center justify-end gap-1 ${
+                      position.unrealized_pnl >= 0 ? 'text-profit' : 'text-loss'
+                    }`}>
+                      {position.unrealized_pnl >= 0 ? (
+                        <TrendingUp size={14} />
+                      ) : (
+                        <TrendingDown size={14} />
+                      )}
+                      <span className="font-mono font-semibold">
+                        {formatPercent(position.unrealized_pnl_percent || 0)}
                       </span>
                     </div>
-                    <p className="text-xs text-gray-500">via {position.whale}</p>
+                    <p className={`text-xs font-mono ${
+                      position.unrealized_pnl >= 0 ? 'text-profit/70' : 'text-loss/70'
+                    }`}>
+                      {formatCurrency(position.unrealized_pnl || 0)}
+                    </p>
                   </div>
                 </div>
-
-                <div className="text-right">
-                  <div className={`flex items-center justify-end gap-1 ${
-                    position.pnl >= 0 ? 'text-profit' : 'text-loss'
-                  }`}>
-                    {position.pnl >= 0 ? (
-                      <TrendingUp size={14} />
-                    ) : (
-                      <TrendingDown size={14} />
-                    )}
-                    <span className="font-mono font-semibold">
-                      {position.pnl >= 0 ? '+' : ''}{position.pnlPercent.toFixed(2)}%
-                    </span>
-                  </div>
-                  <p className={`text-xs font-mono ${
-                    position.pnl >= 0 ? 'text-profit/70' : 'text-loss/70'
-                  }`}>
-                    {position.pnl >= 0 ? '+' : ''}${position.pnl.toFixed(2)}
-                  </p>
-                </div>
-              </div>
-            </motion.div>
-          ))}
-        </div>
+              </motion.div>
+            ))}
+          </div>
+        )}
       </motion.div>
 
       {/* Top Whales */}
@@ -273,18 +251,29 @@ function Dashboard() {
           </button>
         </div>
 
-        <div className="space-y-3">
-          {mockWhales.map((whale, index) => (
-            <WhaleCard key={whale.id} whale={whale} index={index} />
-          ))}
-        </div>
+        {topWhales.length === 0 ? (
+          <div className="glass-card p-6 text-center">
+            <p className="text-gray-500">No whales found</p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {topWhales.map((whale, index) => (
+              <WhaleCard key={whale.id} whale={whale} index={index} />
+            ))}
+          </div>
+        )}
       </motion.div>
     </motion.div>
   )
 }
 
 function WhaleCard({ whale, index }) {
-  const chartData = whale.chartData.map((value, i) => ({ value }))
+  // Generate chart data from whale stats or use placeholder
+  const chartData = whale.chart_data?.map((value) => ({ value })) ||
+    [40, 45, 42, 55, 60, 58, 65, 70, 68, 75, 80, 85].map((value) => ({ value }))
+
+  const weeklyPnl = whale.pnl_7d_percent || whale.weekly_pnl || 0
+  const isFollowing = whale.is_following || false
 
   return (
     <motion.div
@@ -297,9 +286,9 @@ function WhaleCard({ whale, index }) {
         {/* Avatar */}
         <div className="relative">
           <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-biolum-cyan/20 to-biolum-purple/20 flex items-center justify-center text-2xl">
-            {whale.avatar}
+            {whale.avatar || '🐋'}
           </div>
-          {whale.isFollowing && (
+          {isFollowing && (
             <div className="absolute -bottom-1 -right-1 w-5 h-5 bg-profit rounded-full flex items-center justify-center">
               <svg className="w-3 h-3 text-ocean-900" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
@@ -314,7 +303,7 @@ function WhaleCard({ whale, index }) {
             <h3 className="font-semibold text-white truncate">{whale.name}</h3>
           </div>
           <p className="text-xs text-gray-500 font-mono">
-            {whale.address.slice(0, 6)}...{whale.address.slice(-4)}
+            {shortenAddress(whale.wallet_address)}
           </p>
         </div>
 
@@ -324,14 +313,14 @@ function WhaleCard({ whale, index }) {
             <AreaChart data={chartData}>
               <defs>
                 <linearGradient id={`gradient-${whale.id}`} x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={whale.weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'} stopOpacity={0.3} />
-                  <stop offset="100%" stopColor={whale.weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'} stopOpacity={0} />
+                  <stop offset="0%" stopColor={weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'} stopOpacity={0.3} />
+                  <stop offset="100%" stopColor={weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'} stopOpacity={0} />
                 </linearGradient>
               </defs>
               <Area
                 type="monotone"
                 dataKey="value"
-                stroke={whale.weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'}
+                stroke={weeklyPnl >= 0 ? '#00ffc8' : '#ff5f6d'}
                 strokeWidth={1.5}
                 fill={`url(#gradient-${whale.id})`}
               />
@@ -342,11 +331,11 @@ function WhaleCard({ whale, index }) {
         {/* Stats */}
         <div className="text-right">
           <div className={`font-mono font-semibold ${
-            whale.weeklyPnl >= 0 ? 'text-profit' : 'text-loss'
+            weeklyPnl >= 0 ? 'text-profit' : 'text-loss'
           }`}>
-            {whale.weeklyPnl >= 0 ? '+' : ''}{whale.weeklyPnl}%
+            {formatPercent(weeklyPnl)}
           </div>
-          <p className="text-xs text-gray-500">{whale.winRate}% win</p>
+          <p className="text-xs text-gray-500">{whale.win_rate || 0}% win</p>
         </div>
       </div>
     </motion.div>

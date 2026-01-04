@@ -10,8 +10,11 @@ import {
   ArrowUpRight,
   ArrowDownRight,
   Clock,
-  X
+  X,
+  Loader2
 } from 'lucide-react'
+import { useTrades, usePositions } from '../hooks/useApi'
+import { formatCurrency, formatPercent } from '../services/api'
 
 const filterOptions = [
   { id: 'all', label: 'All Trades' },
@@ -28,120 +31,60 @@ const timeFilters = [
   { id: 'all', label: 'All Time' },
 ]
 
-const mockTrades = [
-  {
-    id: 1,
-    symbol: 'PEPE',
-    name: 'Pepe',
-    side: 'LONG',
-    type: 'SPOT',
-    entry: 0.00001234,
-    exit: 0.00001456,
-    size: 150,
-    pnl: 27.35,
-    pnlPercent: 18.23,
-    whale: 'DeFi Chad',
-    whaleAvatar: '🐋',
-    status: 'closed',
-    openedAt: '2024-01-15 14:32',
-    closedAt: '2024-01-15 18:45',
-  },
-  {
-    id: 2,
-    symbol: 'ARB',
-    name: 'Arbitrum',
-    side: 'LONG',
-    type: 'FUTURES',
-    leverage: '5x',
-    entry: 1.24,
-    exit: null,
-    size: 200,
-    pnl: -9.68,
-    pnlPercent: -4.84,
-    whale: 'Whale Alpha',
-    whaleAvatar: '🦈',
-    status: 'open',
-    openedAt: '2024-01-15 10:15',
-    closedAt: null,
-  },
-  {
-    id: 3,
-    symbol: 'SOL',
-    name: 'Solana',
-    side: 'LONG',
-    type: 'SPOT',
-    entry: 98.50,
-    exit: 105.20,
-    size: 300,
-    pnl: 20.41,
-    pnlPercent: 6.80,
-    whale: 'Smart Money',
-    whaleAvatar: '🐬',
-    status: 'closed',
-    openedAt: '2024-01-14 09:00',
-    closedAt: '2024-01-15 12:30',
-  },
-  {
-    id: 4,
-    symbol: 'WIF',
-    name: 'dogwifhat',
-    side: 'LONG',
-    type: 'SPOT',
-    entry: 0.85,
-    exit: 1.24,
-    size: 100,
-    pnl: 45.88,
-    pnlPercent: 45.88,
-    whale: 'DeFi Chad',
-    whaleAvatar: '🐋',
-    status: 'closed',
-    openedAt: '2024-01-13 16:20',
-    closedAt: '2024-01-14 08:15',
-  },
-  {
-    id: 5,
-    symbol: 'BONK',
-    name: 'Bonk',
-    side: 'LONG',
-    type: 'SPOT',
-    entry: 0.0000123,
-    exit: 0.0000098,
-    size: 75,
-    pnl: -15.24,
-    pnlPercent: -20.32,
-    whale: 'Degen King',
-    whaleAvatar: '👑',
-    status: 'closed',
-    openedAt: '2024-01-12 11:45',
-    closedAt: '2024-01-13 14:20',
-  },
-  {
-    id: 6,
-    symbol: 'GMX',
-    name: 'GMX',
-    side: 'LONG',
-    type: 'FUTURES',
-    leverage: '3x',
-    entry: 42.50,
-    exit: null,
-    size: 250,
-    pnl: 32.50,
-    pnlPercent: 13.00,
-    whale: 'Silent Whale',
-    whaleAvatar: '🌊',
-    status: 'open',
-    openedAt: '2024-01-15 08:00',
-    closedAt: null,
-  },
-]
-
 function TradeHistory() {
   const [selectedFilter, setSelectedFilter] = useState('all')
   const [selectedTime, setSelectedTime] = useState('week')
-  const [showFilters, setShowFilters] = useState(false)
   const [selectedTrade, setSelectedTrade] = useState(null)
 
-  const filteredTrades = mockTrades.filter(trade => {
+  // Fetch trades and positions from API
+  const { trades: apiTrades, loading: tradesLoading, error: tradesError } = useTrades({ limit: 50 })
+  const { positions, loading: positionsLoading, closePosition } = usePositions()
+
+  // Combine trades and positions into unified list
+  const allTrades = React.useMemo(() => {
+    const closedTrades = (apiTrades || []).map(trade => ({
+      id: trade.id,
+      symbol: trade.symbol?.replace('USDT', '') || 'UNKNOWN',
+      name: trade.symbol?.replace('USDT', '') || 'Unknown',
+      side: trade.side === 'BUY' ? 'LONG' : 'SHORT',
+      type: trade.trade_type || 'SPOT',
+      leverage: trade.leverage ? `${trade.leverage}x` : null,
+      entry: parseFloat(trade.executed_price || trade.requested_price || 0),
+      exit: trade.status === 'FILLED' ? parseFloat(trade.executed_price || 0) : null,
+      size: parseFloat(trade.trade_value_usdt || 0),
+      pnl: 0, // Calculated from position if available
+      pnlPercent: 0,
+      whale: 'Whale',
+      whaleAvatar: '🐋',
+      status: trade.status === 'FILLED' ? 'closed' : 'pending',
+      openedAt: new Date(trade.created_at).toLocaleString(),
+      closedAt: trade.executed_at ? new Date(trade.executed_at).toLocaleString() : null,
+    }))
+
+    const openPositions = (positions || []).map(pos => ({
+      id: `pos-${pos.id}`,
+      positionId: pos.id,
+      symbol: pos.symbol?.replace('USDT', '') || 'UNKNOWN',
+      name: pos.symbol?.replace('USDT', '') || 'Unknown',
+      side: pos.side === 'BUY' ? 'LONG' : 'SHORT',
+      type: pos.position_type || 'SPOT',
+      leverage: pos.leverage ? `${pos.leverage}x` : null,
+      entry: parseFloat(pos.entry_price || 0),
+      exit: null,
+      size: parseFloat(pos.entry_value_usdt || 0),
+      pnl: parseFloat(pos.unrealized_pnl || 0),
+      pnlPercent: parseFloat(pos.unrealized_pnl_percent || 0),
+      whale: 'Whale',
+      whaleAvatar: '🐋',
+      status: 'open',
+      openedAt: new Date(pos.opened_at).toLocaleString(),
+      closedAt: null,
+    }))
+
+    return [...openPositions, ...closedTrades]
+  }, [apiTrades, positions])
+
+  const filteredTrades = allTrades.filter(trade => {
     if (selectedFilter === 'open' && trade.status !== 'open') return false
     if (selectedFilter === 'closed' && trade.status !== 'closed') return false
     if (selectedFilter === 'profit' && trade.pnl < 0) return false
@@ -155,6 +98,16 @@ function TradeHistory() {
   const lossTrades = filteredTrades.filter(t => t.pnl < 0).length
   const totalPnl = filteredTrades.reduce((sum, t) => sum + t.pnl, 0)
   const winRate = totalTrades > 0 ? (profitTrades / totalTrades * 100).toFixed(1) : 0
+
+  const loading = tradesLoading || positionsLoading
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <Loader2 className="w-8 h-8 text-biolum-cyan animate-spin" />
+      </div>
+    )
+  }
 
   return (
     <div className="px-4 pt-6 pb-4">
@@ -278,7 +231,11 @@ function TradeHistory() {
           >
             <div className="text-4xl mb-3">📊</div>
             <p className="text-gray-400">No trades found</p>
-            <p className="text-gray-500 text-sm">Try adjusting your filters</p>
+            <p className="text-gray-500 text-sm">
+              {allTrades.length === 0
+                ? 'Follow whales and start copy trading'
+                : 'Try adjusting your filters'}
+            </p>
           </motion.div>
         )}
       </div>
@@ -289,6 +246,7 @@ function TradeHistory() {
           <TradeDetailModal
             trade={selectedTrade}
             onClose={() => setSelectedTrade(null)}
+            onClosePosition={closePosition}
           />
         )}
       </AnimatePresence>
@@ -371,7 +329,22 @@ function TradeCard({ trade, index, onClick }) {
   )
 }
 
-function TradeDetailModal({ trade, onClose }) {
+function TradeDetailModal({ trade, onClose, onClosePosition }) {
+  const [closing, setClosing] = useState(false)
+
+  const handleClosePosition = async () => {
+    if (!trade.positionId) return
+    setClosing(true)
+    try {
+      await onClosePosition(trade.positionId)
+      onClose()
+    } catch (err) {
+      console.error('Failed to close position:', err)
+    } finally {
+      setClosing(false)
+    }
+  }
+
   return (
     <motion.div
       initial={{ opacity: 0 }}
@@ -477,7 +450,7 @@ function TradeDetailModal({ trade, onClose }) {
               </div>
               <div className="flex justify-between items-center py-2 border-b border-ocean-600/50">
                 <span className="text-gray-400">Position Size</span>
-                <span className="font-mono font-semibold text-white">${trade.size}</span>
+                <span className="font-mono font-semibold text-white">${trade.size.toFixed(2)}</span>
               </div>
               <div className="flex justify-between items-center py-2 border-b border-ocean-600/50">
                 <span className="text-gray-400">Opened</span>
@@ -505,9 +478,13 @@ function TradeDetailModal({ trade, onClose }) {
           </div>
 
           {/* Action Buttons */}
-          {trade.status === 'open' && (
-            <button className="w-full py-4 rounded-2xl font-semibold text-lg bg-loss/20 text-loss border border-loss/30 hover:bg-loss/30 transition-all">
-              Close Position
+          {trade.status === 'open' && trade.positionId && (
+            <button
+              onClick={handleClosePosition}
+              disabled={closing}
+              className="w-full py-4 rounded-2xl font-semibold text-lg bg-loss/20 text-loss border border-loss/30 hover:bg-loss/30 transition-all disabled:opacity-50"
+            >
+              {closing ? 'Closing...' : 'Close Position'}
             </button>
           )}
         </div>

@@ -15,7 +15,7 @@ settings = get_settings()
 router = APIRouter()
 
 
-@router.post("/telegram")
+@router.post("")
 async def telegram_webhook(request: Request) -> dict[str, str]:
     """
     Webhook endpoint for Telegram Bot updates.

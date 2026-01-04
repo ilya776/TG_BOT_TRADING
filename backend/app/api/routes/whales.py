@@ -39,12 +39,6 @@ class WhaleResponse(BaseModel):
         from_attributes = True
 
 
-class WhaleWithStatsResponse(WhaleResponse):
-    stats: "WhaleStatsResponse | None"
-    is_following: bool = False
-    followers_count: int = 0
-
-
 class WhaleStatsResponse(BaseModel):
     total_trades: int
     winning_trades: int
@@ -64,6 +58,12 @@ class WhaleStatsResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class WhaleWithStatsResponse(WhaleResponse):
+    stats: WhaleStatsResponse | None
+    is_following: bool = False
+    followers_count: int = 0
 
 
 class WhaleFollowResponse(BaseModel):

@@ -168,6 +168,9 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:${DB_PASSWORD}@postgres:5432/whale_copy_trading
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
     depends_on:
       postgres:
         condition: service_healthy
@@ -217,6 +220,8 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:${DB_PASSWORD}@postgres:5432/whale_copy_trading
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
       - ETH_RPC_URL=${ETH_RPC_URL}
       - ETH_RPC_WS_URL=${ETH_RPC_WS_URL}
       - BSC_RPC_URL=${BSC_RPC_URL}
@@ -243,7 +248,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        - VITE_API_URL=/api
+        - VITE_API_URL=/api/v1
         - VITE_WS_URL=/ws
     container_name: whale_frontend
     restart: unless-stopped

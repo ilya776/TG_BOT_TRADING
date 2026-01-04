@@ -48,15 +48,35 @@ celery_app.conf.update(
             "task": "app.workers.tasks.whale_tasks.check_whale_positions",
             "schedule": 30.0,
         },
+        # Update position prices every 10 seconds
+        "update-position-prices": {
+            "task": "app.workers.tasks.trade_tasks.update_position_prices",
+            "schedule": 10.0,
+        },
+        # Monitor positions for SL/TP every 30 seconds
+        "monitor-positions": {
+            "task": "app.workers.tasks.trade_tasks.monitor_positions",
+            "schedule": 30.0,
+        },
         # Sync user balances every 5 minutes
         "sync-user-balances": {
             "task": "app.workers.tasks.trade_tasks.sync_all_user_balances",
+            "schedule": 300.0,
+        },
+        # Update whale follower counts every 5 minutes
+        "update-follower-counts": {
+            "task": "app.workers.tasks.whale_tasks.update_whale_followers_count",
             "schedule": 300.0,
         },
         # Update whale statistics every hour
         "update-whale-stats": {
             "task": "app.workers.tasks.whale_tasks.update_whale_statistics",
             "schedule": 3600.0,
+        },
+        # Clean up old signals daily
+        "cleanup-old-signals": {
+            "task": "app.workers.tasks.whale_tasks.cleanup_old_signals",
+            "schedule": 86400.0,
         },
         # Clean up old notifications daily
         "cleanup-notifications": {

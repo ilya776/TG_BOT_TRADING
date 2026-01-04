@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   Bell,
@@ -13,100 +13,86 @@ import {
   Pause,
   Play,
   AlertTriangle,
-  Sparkles
+  Sparkles,
+  Loader2
 } from 'lucide-react'
-
-const mockAlerts = [
-  {
-    id: 1,
-    whale: {
-      name: 'DeFi Chad',
-      avatar: '🐋',
-      address: '0x742d35Cc6634C0532925a3b844Bc454e4438f44e',
-      winRate: 73,
-    },
-    action: 'BUY',
-    token: 'PEPE',
-    tokenName: 'Pepe',
-    amount: 250000,
-    dex: 'Uniswap',
-    chain: 'ETH',
-    entryPrice: 0.00001234,
-    confidence: 'HIGH',
-    timestamp: Date.now() - 15000, // 15 seconds ago
-    txHash: '0x1234567890abcdef...',
-    autoCopyIn: 10,
-    status: 'pending',
-  },
-  {
-    id: 2,
-    whale: {
-      name: 'Smart Money',
-      avatar: '🐬',
-      address: '0xdef456789abcdef0123456789abcdef01234567',
-      winRate: 71,
-    },
-    action: 'BUY',
-    token: 'ARB',
-    tokenName: 'Arbitrum',
-    amount: 180000,
-    dex: 'Uniswap',
-    chain: 'ARB',
-    entryPrice: 1.24,
-    confidence: 'MEDIUM',
-    timestamp: Date.now() - 120000, // 2 mins ago
-    txHash: '0xabcdef1234567890...',
-    autoCopyIn: 0,
-    status: 'copied',
-  },
-  {
-    id: 3,
-    whale: {
-      name: 'Whale Alpha',
-      avatar: '🦈',
-      address: '0x89ab78cdef0123456789abcdef0123456789abcd',
-      winRate: 68,
-    },
-    action: 'SELL',
-    token: 'SOL',
-    tokenName: 'Solana',
-    amount: 320000,
-    dex: 'Jupiter',
-    chain: 'SOL',
-    entryPrice: 105.20,
-    confidence: 'HIGH',
-    timestamp: Date.now() - 300000, // 5 mins ago
-    txHash: '0x9876543210fedcba...',
-    autoCopyIn: 0,
-    status: 'skipped',
-  },
-  {
-    id: 4,
-    whale: {
-      name: 'Silent Whale',
-      avatar: '🌊',
-      address: '0x999888777666555444333222111000aaabbbccc',
-      winRate: 78,
-    },
-    action: 'BUY',
-    token: 'GMX',
-    tokenName: 'GMX',
-    amount: 450000,
-    dex: 'Uniswap',
-    chain: 'ARB',
-    entryPrice: 42.50,
-    confidence: 'HIGH',
-    timestamp: Date.now() - 600000, // 10 mins ago
-    txHash: '0xfedcba0987654321...',
-    autoCopyIn: 0,
-    status: 'copied',
-  },
-]
+import { signalsApi } from '../services/api'
+import { shortenAddress, formatCurrency } from '../services/api'
 
 function LiveAlerts() {
-  const [alerts, setAlerts] = useState(mockAlerts)
+  const [alerts, setAlerts] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
   const [isPaused, setIsPaused] = useState(false)
   const [filter, setFilter] = useState('all') // all, pending, copied, skipped
+
+  // Fetch signals from API
+  const fetchSignals = useCallback(async () => {
+    try {
+      const data = await signalsApi.getSignals({ limit: 50 })
+      // Transform API response to alert format
+      const transformedAlerts = (data || []).map(signal => ({
+        id: signal.id,
+        whale: {
+          id: signal.whale?.id || 0,
+          name: signal.whale?.name || 'Unknown Whale',
+          avatar: signal.whale?.avatar || '🐋',
+          address: signal.whale?.wallet_address || '',
+          winRate: parseFloat(signal.whale?.win_rate || 0),
+        },
+        action: signal.action,
+        token: signal.token,
+        tokenName: signal.token_name || signal.token,
+        amount: parseFloat(signal.amount_usd || 0),
+        dex: signal.dex,
+        chain: signal.chain,
+        entryPrice: parseFloat(signal.entry_price || 0),
+        confidence: signal.confidence,
+        timestamp: new Date(signal.detected_at).getTime(),
+        txHash: signal.tx_hash,
+        autoCopyIn: signal.auto_copy_in || 0,
+        status: signal.status === 'PENDING' ? 'pending' :
+                signal.status === 'PROCESSED' ? 'copied' : 'skipped',
+        cexSymbol: signal.cex_symbol,
+        cexAvailable: signal.cex_available,
+      }))
+      setAlerts(transformedAlerts)
+      setError(null)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchSignals()
+    // Refresh every 10 seconds
+    const interval = setInterval(fetchSignals, 10000)
+    return () => clearInterval(interval)
+  }, [fetchSignals])
+
+  const handleCopy = async (alertId) => {
+    try {
+      await signalsApi.copySignal(alertId)
+      setAlerts(alerts.map(a =>
+        a.id === alertId ? { ...a, status: 'copied', autoCopyIn: 0 } : a
+      ))
+    } catch (err) {
+      console.error('Failed to copy signal:', err)
+    }
+  }
+
+  const handleSkip = async (alertId) => {
+    try {
+      await signalsApi.skipSignal(alertId)
+      setAlerts(alerts.map(a =>
+        a.id === alertId ? { ...a, status: 'skipped', autoCopyIn: 0 } : a
+      ))
+    } catch (err) {
+      console.error('Failed to skip signal:', err)
+    }
+  }
 
   const filteredAlerts = alerts.filter(alert => {
     if (filter === 'all') return true
@@ -114,6 +100,14 @@ function LiveAlerts() {
   })
 
   const pendingCount = alerts.filter(a => a.status === 'pending').length
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <Loader2 className="w-8 h-8 text-biolum-cyan animate-spin" />
+      </div>
+    )
+  }
 
   return (
     <div className="px-4 pt-6 pb-4">
@@ -189,6 +183,13 @@ function LiveAlerts() {
         ))}
       </motion.div>
 
+      {/* Error Message */}
+      {error && (
+        <div className="mb-4 p-3 bg-loss/10 rounded-lg border border-loss/20">
+          <p className="text-sm text-loss">{error}</p>
+        </div>
+      )}
+
       {/* Alerts List */}
       <div className="space-y-4">
         <AnimatePresence>
@@ -198,16 +199,8 @@ function LiveAlerts() {
               alert={alert}
               index={index}
               isPaused={isPaused}
-              onCopy={() => {
-                setAlerts(alerts.map(a =>
-                  a.id === alert.id ? { ...a, status: 'copied', autoCopyIn: 0 } : a
-                ))
-              }}
-              onSkip={() => {
-                setAlerts(alerts.map(a =>
-                  a.id === alert.id ? { ...a, status: 'skipped', autoCopyIn: 0 } : a
-                ))
-              }}
+              onCopy={() => handleCopy(alert.id)}
+              onSkip={() => handleSkip(alert.id)}
             />
           ))}
         </AnimatePresence>
@@ -220,7 +213,11 @@ function LiveAlerts() {
           >
             <div className="text-4xl mb-3">🔔</div>
             <p className="text-gray-400">No alerts found</p>
-            <p className="text-gray-500 text-sm">Whale signals will appear here</p>
+            <p className="text-gray-500 text-sm">
+              {alerts.length === 0
+                ? 'Follow whales to receive trading signals'
+                : 'No signals match your filter'}
+            </p>
           </motion.div>
         )}
       </div>
@@ -269,6 +266,7 @@ function AlertCard({ alert, index, isPaused, onCopy, onSkip }) {
 
   const confidenceColor = {
     HIGH: 'text-profit bg-profit/10 border-profit/30',
+    VERY_HIGH: 'text-profit bg-profit/10 border-profit/30',
     MEDIUM: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30',
     LOW: 'text-loss bg-loss/10 border-loss/30',
   }
@@ -277,6 +275,19 @@ function AlertCard({ alert, index, isPaused, onCopy, onSkip }) {
     pending: null,
     copied: { text: 'Copied', color: 'bg-profit/20 text-profit' },
     skipped: { text: 'Skipped', color: 'bg-gray-500/20 text-gray-400' },
+  }
+
+  const getExplorerUrl = (chain, txHash) => {
+    const explorers = {
+      'ETH': 'https://etherscan.io/tx/',
+      'ETHEREUM': 'https://etherscan.io/tx/',
+      'BSC': 'https://bscscan.com/tx/',
+      'ARB': 'https://arbiscan.io/tx/',
+      'ARBITRUM': 'https://arbiscan.io/tx/',
+      'POLYGON': 'https://polygonscan.com/tx/',
+      'OPTIMISM': 'https://optimistic.etherscan.io/tx/',
+    }
+    return (explorers[chain?.toUpperCase()] || 'https://etherscan.io/tx/') + txHash
   }
 
   return (
@@ -322,7 +333,7 @@ function AlertCard({ alert, index, isPaused, onCopy, onSkip }) {
               <div className="flex items-center gap-2">
                 <span className="font-semibold text-white">{alert.whale.name}</span>
                 <span className="text-xs text-gray-500">
-                  {alert.whale.winRate}% win
+                  {alert.whale.winRate > 0 ? `${alert.whale.winRate.toFixed(0)}% win` : ''}
                 </span>
               </div>
               <div className="flex items-center gap-2 mt-0.5">
@@ -354,7 +365,7 @@ function AlertCard({ alert, index, isPaused, onCopy, onSkip }) {
               <span className="font-display font-bold text-xl text-white">{alert.token}</span>
               <span className="text-gray-500 text-sm">({alert.tokenName})</span>
             </div>
-            <span className={`text-[10px] font-bold px-2 py-1 rounded border ${confidenceColor[alert.confidence]}`}>
+            <span className={`text-[10px] font-bold px-2 py-1 rounded border ${confidenceColor[alert.confidence] || confidenceColor.MEDIUM}`}>
               {alert.confidence}
             </span>
           </div>
@@ -363,7 +374,7 @@ function AlertCard({ alert, index, isPaused, onCopy, onSkip }) {
             <div>
               <p className="text-gray-500 text-xs">Amount</p>
               <p className="font-mono font-semibold text-white">
-                ${(alert.amount / 1000).toFixed(0)}K
+                {formatCurrency(alert.amount)}
               </p>
             </div>
             <div>
@@ -384,12 +395,12 @@ function AlertCard({ alert, index, isPaused, onCopy, onSkip }) {
             <div>
               <p className="text-gray-500 text-xs">TX Hash</p>
               <a
-                href={`https://etherscan.io/tx/${alert.txHash}`}
+                href={getExplorerUrl(alert.chain, alert.txHash)}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="font-mono text-xs text-biolum-cyan flex items-center gap-1 hover:underline"
               >
-                {alert.txHash.slice(0, 10)}...
+                {shortenAddress(alert.txHash)}
                 <ExternalLink size={10} />
               </a>
             </div>
@@ -397,7 +408,7 @@ function AlertCard({ alert, index, isPaused, onCopy, onSkip }) {
         </div>
 
         {/* Your Copy Info */}
-        {alert.status === 'pending' && (
+        {alert.status === 'pending' && alert.cexAvailable && (
           <div className="mb-4">
             <div className="flex items-center justify-between text-sm mb-2">
               <span className="text-gray-400 flex items-center gap-1">
@@ -411,14 +422,22 @@ function AlertCard({ alert, index, isPaused, onCopy, onSkip }) {
               )}
             </div>
             <div className="flex items-center justify-between bg-ocean-800/50 px-3 py-2 rounded-lg">
-              <span className="text-gray-400">Amount</span>
-              <span className="font-mono font-semibold text-white">$100.00</span>
+              <span className="text-gray-400">Symbol</span>
+              <span className="font-mono font-semibold text-white">{alert.cexSymbol || 'N/A'}</span>
             </div>
           </div>
         )}
 
+        {/* Not available on CEX warning */}
+        {alert.status === 'pending' && !alert.cexAvailable && (
+          <div className="mb-4 flex items-center gap-2 px-3 py-2 bg-yellow-400/10 rounded-lg border border-yellow-400/20">
+            <AlertTriangle size={16} className="text-yellow-400" />
+            <span className="text-sm text-yellow-400">Token not available on CEX</span>
+          </div>
+        )}
+
         {/* Action Buttons */}
-        {alert.status === 'pending' && (
+        {alert.status === 'pending' && alert.cexAvailable && (
           <div className="flex gap-3">
             <button
               onClick={onCopy}
@@ -435,6 +454,17 @@ function AlertCard({ alert, index, isPaused, onCopy, onSkip }) {
               Skip
             </button>
           </div>
+        )}
+
+        {/* Skip only for tokens not on CEX */}
+        {alert.status === 'pending' && !alert.cexAvailable && (
+          <button
+            onClick={onSkip}
+            className="w-full btn-secondary flex items-center justify-center gap-2 py-3"
+          >
+            <X size={18} />
+            Dismiss
+          </button>
         )}
 
         {/* Copied/Skipped State */}
