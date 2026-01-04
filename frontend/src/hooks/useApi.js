@@ -367,6 +367,7 @@ export function useWhale(whaleId) {
 
 /**
  * Hook for whales the user is following
+ * Returns empty array if not authenticated
  */
 export function useFollowingWhales() {
   const [whales, setWhales] = useState([]);
@@ -374,30 +375,52 @@ export function useFollowingWhales() {
   const [error, setError] = useState(null);
 
   const fetchFollowing = useCallback(async () => {
+    // Skip if not authenticated
+    if (!authApi.isAuthenticated()) {
+      setWhales([]);
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     try {
       const data = await whalesApi.getFollowing();
-      setWhales(data);
+      setWhales(Array.isArray(data) ? data : []);
       setError(null);
     } catch (err) {
-      setError(err.message);
+      // On auth error, just return empty
+      if (err.message?.includes('401') || err.message?.includes('authorization')) {
+        setWhales([]);
+        setError(null);
+      } else {
+        setError(err.message);
+      }
     } finally {
       setLoading(false);
     }
   }, []);
 
   const followWhale = useCallback(async (whaleId, settings = {}) => {
+    if (!authApi.isAuthenticated()) {
+      throw new Error('Please login via Telegram to follow whales');
+    }
     const result = await whalesApi.followWhale(whaleId, settings);
-    fetchFollowing(); // Refresh list
+    fetchFollowing();
     return result;
   }, [fetchFollowing]);
 
   const unfollowWhale = useCallback(async (whaleId) => {
+    if (!authApi.isAuthenticated()) {
+      throw new Error('Please login via Telegram');
+    }
     await whalesApi.unfollowWhale(whaleId);
     setWhales((prev) => prev.filter((w) => w.whale_id !== whaleId));
   }, []);
 
   const updateFollow = useCallback(async (whaleId, settings) => {
+    if (!authApi.isAuthenticated()) {
+      throw new Error('Please login via Telegram');
+    }
     const updated = await whalesApi.updateFollow(whaleId, settings);
     setWhales((prev) =>
       prev.map((w) => (w.whale_id === whaleId ? { ...w, ...updated } : w))
@@ -424,26 +447,40 @@ export function useFollowingWhales() {
 
 /**
  * Hook for trade history
+ * Returns empty array if not authenticated
  */
 export function useTrades(params = {}) {
   const [trades, setTrades] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [hasMore, setHasMore] = useState(true);
+  const [hasMore, setHasMore] = useState(false);
 
   const fetchTrades = useCallback(async (reset = true) => {
+    // Skip if not authenticated
+    if (!authApi.isAuthenticated()) {
+      setTrades([]);
+      setLoading(false);
+      setHasMore(false);
+      return;
+    }
+
     setLoading(true);
     try {
       const data = await tradesApi.getTrades({
         ...params,
         offset: reset ? 0 : trades.length,
       });
-      const newTrades = data.items || data;
+      const newTrades = Array.isArray(data) ? data : (data.items || []);
       setTrades(reset ? newTrades : [...trades, ...newTrades]);
       setHasMore(newTrades.length === (params.limit || 20));
       setError(null);
     } catch (err) {
-      setError(err.message);
+      if (err.message?.includes('401') || err.message?.includes('authorization')) {
+        setTrades([]);
+        setError(null);
+      } else {
+        setError(err.message);
+      }
     } finally {
       setLoading(false);
     }
@@ -464,6 +501,7 @@ export function useTrades(params = {}) {
 
 /**
  * Hook for open positions
+ * Returns empty array if not authenticated
  */
 export function usePositions() {
   const [positions, setPositions] = useState([]);
@@ -471,19 +509,34 @@ export function usePositions() {
   const [error, setError] = useState(null);
 
   const fetchPositions = useCallback(async () => {
+    // Skip if not authenticated
+    if (!authApi.isAuthenticated()) {
+      setPositions([]);
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     try {
       const data = await tradesApi.getPositions();
-      setPositions(data);
+      setPositions(Array.isArray(data) ? data : []);
       setError(null);
     } catch (err) {
-      setError(err.message);
+      if (err.message?.includes('401') || err.message?.includes('authorization')) {
+        setPositions([]);
+        setError(null);
+      } else {
+        setError(err.message);
+      }
     } finally {
       setLoading(false);
     }
   }, []);
 
   const updatePosition = useCallback(async (positionId, updates) => {
+    if (!authApi.isAuthenticated()) {
+      throw new Error('Please login via Telegram');
+    }
     const updated = await tradesApi.updatePosition(positionId, updates);
     setPositions((prev) =>
       prev.map((p) => (p.id === positionId ? updated : p))
@@ -492,6 +545,9 @@ export function usePositions() {
   }, []);
 
   const closePosition = useCallback(async (positionId) => {
+    if (!authApi.isAuthenticated()) {
+      throw new Error('Please login via Telegram');
+    }
     await tradesApi.closePosition(positionId);
     setPositions((prev) => prev.filter((p) => p.id !== positionId));
   }, []);
@@ -500,8 +556,9 @@ export function usePositions() {
     fetchPositions();
   }, [fetchPositions]);
 
-  // Auto-refresh positions every 10 seconds
+  // Auto-refresh positions every 10 seconds (only if authenticated)
   useEffect(() => {
+    if (!authApi.isAuthenticated()) return;
     const interval = setInterval(fetchPositions, 10000);
     return () => clearInterval(interval);
   }, [fetchPositions]);

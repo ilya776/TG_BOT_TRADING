@@ -168,6 +168,25 @@ function SettingsScreen() {
         <p className="text-gray-400 text-sm mt-1">Configure your trading preferences</p>
       </motion.div>
 
+      {/* Demo Mode Banner */}
+      {(isDemo || keysDemo) && (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="mb-5 p-4 rounded-xl bg-gradient-to-r from-yellow-500/10 to-orange-500/10 border border-yellow-500/20"
+        >
+          <div className="flex items-center gap-3">
+            <AlertTriangle className="text-yellow-400" size={24} />
+            <div>
+              <p className="text-white font-semibold text-sm">Demo Mode</p>
+              <p className="text-gray-400 text-xs">
+                Open this app in Telegram to connect your exchange and start trading
+              </p>
+            </div>
+          </div>
+        </motion.div>
+      )}
+
       {/* Error Message */}
       {error && (
         <div className="mb-4 p-3 bg-loss/10 rounded-lg border border-loss/20">
