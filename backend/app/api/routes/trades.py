@@ -2,6 +2,7 @@
 Trade API Routes
 """
 
+import logging
 from datetime import datetime
 from decimal import Decimal
 
@@ -19,6 +20,11 @@ from app.models.trade import (
     TradeStatus,
     TradeType,
 )
+from app.models.user import ExchangeName, UserAPIKey
+from app.services.exchanges import PositionSide, get_exchange_executor
+from app.utils.encryption import get_encryption_manager
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -245,7 +251,7 @@ async def close_position(
     current_user: CurrentUser,
     db: DbSession,
 ) -> Position:
-    """Manually close a position."""
+    """Manually close a position on the exchange."""
     result = await db.execute(
         select(Position).where(
             Position.id == position_id,
@@ -261,14 +267,146 @@ async def close_position(
             detail="Open position not found",
         )
 
-    # TODO: Execute close order on exchange
-    # For now, just update status
-    position.status = PositionStatus.CLOSED
-    position.close_reason = request.reason
-    position.closed_at = datetime.utcnow()
-    position.exit_price = position.current_price  # Use current price as exit
-    position.realized_pnl = position.unrealized_pnl
-    position.realized_pnl_percent = position.unrealized_pnl_percent
+    # Get user's API key for this exchange
+    try:
+        exchange_enum = ExchangeName(position.exchange.upper())
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid exchange: {position.exchange}",
+        )
+
+    keys_result = await db.execute(
+        select(UserAPIKey).where(
+            UserAPIKey.user_id == current_user.id,
+            UserAPIKey.exchange == exchange_enum,
+            UserAPIKey.is_active == True,
+        )
+    )
+    api_key = keys_result.scalar_one_or_none()
+
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"No active API key found for {position.exchange}. Please add API key in Settings.",
+        )
+
+    # Decrypt credentials
+    encryption = get_encryption_manager()
+    decrypted_key = encryption.decrypt(api_key.api_key_encrypted)
+    decrypted_secret = encryption.decrypt(api_key.api_secret_encrypted)
+    decrypted_passphrase = None
+    if api_key.passphrase_encrypted:
+        decrypted_passphrase = encryption.decrypt(api_key.passphrase_encrypted)
+
+    # Initialize exchange executor
+    executor = None
+    try:
+        executor = get_exchange_executor(
+            exchange_name=exchange_enum.value.lower(),
+            api_key=decrypted_key,
+            api_secret=decrypted_secret,
+            passphrase=decrypted_passphrase,
+            testnet=api_key.is_testnet,
+        )
+        await executor.initialize()
+
+        # Execute close order based on position type
+        is_spot = position.position_type == TradeType.SPOT or not position.leverage or position.leverage <= 1
+        quantity = Decimal(str(position.quantity)) if position.quantity else None
+
+        if is_spot:
+            # For spot: get actual balance from exchange and sell that
+            asset = position.symbol.replace("USDT", "")
+            balances = await executor.get_account_balance()
+            asset_balance = next((b for b in balances if b.asset == asset), None)
+
+            if not asset_balance or asset_balance.free <= 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"No {asset} balance available to sell",
+                )
+
+            # Use actual balance from exchange (may differ slightly from DB)
+            actual_quantity = asset_balance.free
+            logger.info(f"Closing SPOT position: selling {actual_quantity} {asset} (DB had {quantity})")
+
+            order_result = await executor.spot_market_sell(
+                symbol=position.symbol,
+                quantity=actual_quantity,
+            )
+
+            # Check for remaining dust after LOT_SIZE rounding
+            filled_qty = order_result.filled_quantity or Decimal("0")
+            dust_remaining = actual_quantity - filled_qty
+            if dust_remaining > 0:
+                dust_value = dust_remaining * (order_result.avg_fill_price or Decimal("0"))
+                logger.warning(
+                    f"Dust remaining after close: {dust_remaining} {asset} (~${dust_value:.2f}). "
+                    f"This is due to exchange LOT_SIZE filter. Use Binance 'Convert Small Balance to BNB' to clean up."
+                )
+        else:
+            # For futures: close the position
+            position_side = PositionSide.LONG if position.side == "BUY" else PositionSide.SHORT
+            logger.info(f"Closing FUTURES position: {position_side.value} {position.symbol}")
+            order_result = await executor.futures_close_position(
+                symbol=position.symbol,
+                position_side=position_side,
+                quantity=quantity,
+            )
+
+        # Update position with actual execution results - do this FIRST before any calculations
+        now = datetime.utcnow()
+        position.status = PositionStatus.CLOSED
+        position.close_reason = request.reason
+        position.closed_at = now
+        position.exit_price = order_result.avg_fill_price if order_result.avg_fill_price else position.current_price
+
+        # Update filled quantity from actual order
+        if order_result.filled_quantity:
+            position.remaining_quantity = Decimal("0")
+
+        logger.info(f"Position {position_id} closed at {now}, exit_price={position.exit_price}")
+
+        # Calculate realized PnL based on actual exit price (wrapped in try to not lose close status)
+        try:
+            if position.exit_price and position.entry_price:
+                entry = Decimal(str(position.entry_price))
+                exit_price = Decimal(str(position.exit_price))
+                size = Decimal(str(position.entry_value_usdt or 0))
+
+                if entry > 0 and size > 0:
+                    if position.side == "BUY":
+                        pnl_percent = ((exit_price - entry) / entry) * 100
+                    else:
+                        pnl_percent = ((entry - exit_price) / entry) * 100
+
+                    position.realized_pnl = (pnl_percent / 100) * size
+                    position.realized_pnl_percent = pnl_percent
+                else:
+                    position.realized_pnl = position.unrealized_pnl or Decimal("0")
+                    position.realized_pnl_percent = position.unrealized_pnl_percent or Decimal("0")
+            else:
+                position.realized_pnl = position.unrealized_pnl or Decimal("0")
+                position.realized_pnl_percent = position.unrealized_pnl_percent or Decimal("0")
+        except Exception as pnl_error:
+            logger.error(f"Failed to calculate PnL for position {position_id}: {pnl_error}")
+            position.realized_pnl = Decimal("0")
+            position.realized_pnl_percent = Decimal("0")
+
+        logger.info(f"Position {position_id} closed successfully. PnL: {position.realized_pnl} ({position.realized_pnl_percent}%)")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to close position {position_id} on exchange: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to close position on exchange: {str(e)}",
+        )
+    finally:
+        if executor:
+            await executor.close()
 
     await db.commit()
     await db.refresh(position)

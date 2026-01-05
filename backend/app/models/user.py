@@ -226,3 +226,71 @@ class UserAPIKey(Base):
 
     def __repr__(self) -> str:
         return f"<UserAPIKey(user_id={self.user_id}, exchange={self.exchange})>"
+
+
+class UserExchangeBalance(Base):
+    """Per-exchange balance tracking for users."""
+
+    __tablename__ = "user_exchange_balances"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    exchange: Mapped[ExchangeName] = mapped_column(SQLEnum(ExchangeName))
+
+    # Spot balances (in USDT equivalent)
+    spot_total_usdt: Mapped[Decimal] = mapped_column(
+        Numeric(20, 8), default=Decimal("0")
+    )
+    spot_available_usdt: Mapped[Decimal] = mapped_column(
+        Numeric(20, 8), default=Decimal("0")
+    )
+
+    # Futures balances (in USDT equivalent)
+    futures_total_usdt: Mapped[Decimal] = mapped_column(
+        Numeric(20, 8), default=Decimal("0")
+    )
+    futures_available_usdt: Mapped[Decimal] = mapped_column(
+        Numeric(20, 8), default=Decimal("0")
+    )
+    futures_unrealized_pnl: Mapped[Decimal] = mapped_column(
+        Numeric(20, 8), default=Decimal("0")
+    )
+
+    # Detailed asset breakdown (JSON)
+    spot_assets: Mapped[str | None] = mapped_column(Text)  # JSON string
+    futures_assets: Mapped[str | None] = mapped_column(Text)  # JSON string
+
+    # Connection status
+    is_connected: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_sync_error: Mapped[str | None] = mapped_column(Text)
+
+    # Timestamps
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+    # Relationships
+    user: Mapped["User"] = relationship()
+
+    __table_args__ = (
+        Index("ix_user_exchange_balances_user_exchange", "user_id", "exchange", unique=True),
+    )
+
+    def __repr__(self) -> str:
+        return f"<UserExchangeBalance(user_id={self.user_id}, exchange={self.exchange})>"
+
+    @property
+    def total_usdt(self) -> Decimal:
+        """Total balance across spot and futures."""
+        return self.spot_total_usdt + self.futures_total_usdt
+
+    @property
+    def available_usdt(self) -> Decimal:
+        """Available balance across spot and futures."""
+        return self.spot_available_usdt + self.futures_available_usdt

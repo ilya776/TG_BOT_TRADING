@@ -3,10 +3,12 @@ Whale monitoring Celery tasks
 """
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import select, func, and_
+import redis
+from sqlalchemy import select, func, and_, text
 
 from app.database import get_sync_db
 from app.models.signal import SignalStatus, WhaleSignal
@@ -17,6 +19,53 @@ from app.workers.tasks.trade_tasks import execute_copy_trade
 
 logger = logging.getLogger(__name__)
 
+# Redis client for distributed locks
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+_redis_client = None
+
+
+def get_redis_client():
+    """Get Redis client singleton."""
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(REDIS_URL)
+    return _redis_client
+
+
+class SignalProcessingLock:
+    """
+    Distributed lock to prevent duplicate signal processing.
+    Uses Redis SET NX to ensure only one task processes a signal.
+    """
+
+    LOCK_TTL = 600  # 10 minutes - long enough for processing
+
+    def __init__(self, signal_id: int):
+        self.signal_id = signal_id
+        self.key = f"signal_lock:{signal_id}"
+        self.client = get_redis_client()
+        self.acquired = False
+
+    def acquire(self) -> bool:
+        """Try to acquire the lock. Returns True if successful."""
+        self.acquired = self.client.set(
+            self.key,
+            datetime.utcnow().isoformat(),
+            nx=True,
+            ex=self.LOCK_TTL,
+        )
+        return bool(self.acquired)
+
+    def release(self):
+        """Release the lock."""
+        if self.acquired:
+            self.client.delete(self.key)
+            self.acquired = False
+
+    def is_locked(self) -> bool:
+        """Check if signal is currently being processed."""
+        return self.client.exists(self.key) > 0
+
 
 @celery_app.task
 def check_whale_positions():
@@ -24,46 +73,71 @@ def check_whale_positions():
     Check all tracked whale positions for exits/changes.
     When a whale exits a position, trigger close for all followers.
     Runs every 30 seconds.
+
+    Uses dual-layer protection:
+    1. DB-level: FOR UPDATE SKIP LOCKED prevents race within same worker
+    2. Redis-level: SignalProcessingLock prevents race across workers
     """
     logger.debug("Checking whale positions")
 
-    # This task monitors on-chain whale positions
-    # When a whale sells/exits, it triggers followers to exit too
-
-    closed_signals = 0
+    queued_signals = 0
+    skipped_signals = 0
 
     with get_sync_db() as db:
-        # Get all pending signals that haven't been processed yet
+        # Get all pending signals with row-level locking to prevent race conditions
+        # FOR UPDATE SKIP LOCKED ensures two workers never process the same signal
         result = db.execute(
             select(WhaleSignal)
             .where(WhaleSignal.status == SignalStatus.PENDING)
-            .order_by(WhaleSignal.created_at.asc())
-            .limit(10)  # Process in batches
+            .order_by(WhaleSignal.detected_at.asc())
+            .limit(10)
+            .with_for_update(skip_locked=True)  # Prevents race conditions
         )
 
         signals = result.scalars().all()
 
         for signal in signals:
             try:
+                # Try to acquire distributed lock (prevents duplicate queueing)
+                lock = SignalProcessingLock(signal.id)
+                if not lock.acquire():
+                    logger.debug(f"Signal {signal.id} already being processed (lock held)")
+                    skipped_signals += 1
+                    continue
+
                 # Queue the signal for copy trade execution
                 execute_copy_trade.delay(signal.id)
                 signal.status = SignalStatus.PROCESSING
-                closed_signals += 1
+                queued_signals += 1
                 logger.info(f"Queued signal {signal.id} for processing")
+
+                # Note: Lock is NOT released here - it will be released by
+                # execute_copy_trade task or expire after 10 minutes
 
             except Exception as e:
                 logger.error(f"Failed to queue signal {signal.id}: {e}")
                 signal.status = SignalStatus.FAILED
+                # Release lock on failure to allow retry
+                if 'lock' in locals():
+                    lock.release()
 
         db.commit()
 
-    return {"status": "checked", "queued_signals": closed_signals}
+    return {
+        "status": "checked",
+        "queued_signals": queued_signals,
+        "skipped_signals": skipped_signals,
+    }
 
 
 @celery_app.task
 def process_whale_transaction(tx_hash: str, whale_id: int, chain: str):
     """
     Process a new whale transaction detected by the monitor.
+
+    Uses row-level locking and distributed lock to prevent:
+    1. Race conditions between concurrent calls with same tx_hash
+    2. Duplicate queueing of copy trade tasks
 
     Args:
         tx_hash: Transaction hash
@@ -72,27 +146,32 @@ def process_whale_transaction(tx_hash: str, whale_id: int, chain: str):
     """
     logger.info(f"Processing whale transaction {tx_hash}")
 
-    # This is called by the whale monitor when it detects a new transaction
-    # The whale monitor has already parsed the transaction and created a signal
-
     with get_sync_db() as db:
-        # Check if signal already exists
+        # Use FOR UPDATE to lock the signal row and prevent race conditions
         result = db.execute(
             select(WhaleSignal)
             .where(WhaleSignal.tx_hash == tx_hash)
+            .with_for_update(nowait=True)  # Fail fast if another task has lock
         )
         signal = result.scalar_one_or_none()
 
         if signal:
-            # Queue for copy trade execution if pending
+            # Only process if still PENDING
             if signal.status == SignalStatus.PENDING:
-                execute_copy_trade.delay(signal.id)
-                signal.status = SignalStatus.PROCESSING
-                db.commit()
+                # Try to acquire distributed lock
+                lock = SignalProcessingLock(signal.id)
+                if lock.acquire():
+                    execute_copy_trade.delay(signal.id)
+                    signal.status = SignalStatus.PROCESSING
+                    db.commit()
+                    logger.info(f"Queued signal {signal.id} from tx {tx_hash}")
+                else:
+                    logger.debug(f"Signal {signal.id} already being processed")
 
             return {
                 "status": "processed",
                 "signal_id": signal.id,
+                "signal_status": signal.status.value,
                 "tx_hash": tx_hash,
             }
 
@@ -167,9 +246,9 @@ def update_whale_statistics():
                     month_ago = now - timedelta(days=30)
                     three_months_ago = now - timedelta(days=90)
 
-                    week_signals = [s for s in signals if s.created_at >= week_ago]
-                    month_signals = [s for s in signals if s.created_at >= month_ago]
-                    quarter_signals = [s for s in signals if s.created_at >= three_months_ago]
+                    week_signals = [s for s in signals if s.detected_at >= week_ago]
+                    month_signals = [s for s in signals if s.detected_at >= month_ago]
+                    quarter_signals = [s for s in signals if s.detected_at >= three_months_ago]
 
                     # Estimate P&L based on confidence (simplified)
                     def estimate_pnl(signal_list):
@@ -181,10 +260,10 @@ def update_whale_statistics():
                                 pnl += s.amount_usd * (multiplier - Decimal("0.5")) * Decimal("0.1")
                         return pnl
 
-                    stats.pnl_7d = estimate_pnl(week_signals)
-                    stats.pnl_30d = estimate_pnl(month_signals)
-                    stats.pnl_90d = estimate_pnl(quarter_signals)
-                    stats.total_pnl = estimate_pnl(signals)
+                    stats.profit_7d = estimate_pnl(week_signals)
+                    stats.profit_30d = estimate_pnl(month_signals)
+                    stats.profit_90d = estimate_pnl(quarter_signals)
+                    stats.total_profit_usd = estimate_pnl(signals)
 
                     # Average trade size
                     if total_signals > 0:
@@ -276,13 +355,12 @@ def update_whale_followers_count():
     logger.debug("Updating whale follower counts")
 
     with get_sync_db() as db:
-        # Get follower counts
+        # Get follower counts (all follows counted, no is_active filter)
         result = db.execute(
             select(
                 UserWhaleFollow.whale_id,
                 func.count(UserWhaleFollow.id).label("follower_count")
             )
-            .where(UserWhaleFollow.is_active == True)
             .group_by(UserWhaleFollow.whale_id)
         )
 
@@ -301,6 +379,54 @@ def update_whale_followers_count():
 
 
 @celery_app.task
+def sync_exchange_leaderboards():
+    """
+    Sync top traders from exchange leaderboards to database.
+    Fetches real data from Binance and Bybit leaderboards.
+    Runs every 5 minutes.
+    """
+    logger.info("Syncing exchange leaderboards")
+
+    try:
+        from app.services.exchange_leaderboard import sync_exchange_leaderboards as do_sync
+        synced = run_async(do_sync())
+        logger.info(f"Exchange leaderboard sync complete: {synced} traders")
+        return {"status": "completed", "synced_traders": synced}
+    except Exception as e:
+        logger.error(f"Exchange leaderboard sync failed: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+def run_async(coro):
+    """Run async code in sync context."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
+
+
+@celery_app.task
+def generate_trader_signals():
+    """
+    Generate trading signals from exchange leaderboard trader positions.
+    Monitors position changes and creates signals when traders open/close positions.
+    Runs every 2 minutes.
+    """
+    logger.info("Generating trader signals from positions")
+
+    try:
+        from app.services.trader_signals import generate_trader_signals as do_generate
+        signals_count = run_async(do_generate())
+        logger.info(f"Generated {signals_count} new trading signals")
+        return {"status": "completed", "signals_generated": signals_count}
+    except Exception as e:
+        logger.error(f"Trader signal generation failed: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+@celery_app.task
 def cleanup_old_signals():
     """
     Clean up old processed signals.
@@ -315,7 +441,7 @@ def cleanup_old_signals():
         result = db.execute(
             select(WhaleSignal)
             .where(
-                WhaleSignal.created_at < cutoff,
+                WhaleSignal.detected_at < cutoff,
                 WhaleSignal.status.in_([SignalStatus.PROCESSED, SignalStatus.FAILED]),
             )
         )

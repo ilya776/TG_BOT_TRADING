@@ -51,6 +51,7 @@ class TradeStatus(str, Enum):
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
+    NEEDS_RECONCILIATION = "NEEDS_RECONCILIATION"  # For orphaned trades that need manual review
 
 
 class PositionStatus(str, Enum):

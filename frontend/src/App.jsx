@@ -6,7 +6,9 @@ import {
   History,
   Bell,
   Settings,
-  Waves
+  BarChart2,
+  Waves,
+  Zap
 } from 'lucide-react'
 
 import Dashboard from './screens/Dashboard'
@@ -14,7 +16,18 @@ import WhaleDiscovery from './screens/WhaleDiscovery'
 import TradeHistory from './screens/TradeHistory'
 import LiveAlerts from './screens/LiveAlerts'
 import SettingsScreen from './screens/Settings'
+import Statistics from './screens/Statistics'
+import ErrorBoundary from './components/ErrorBoundary'
 import { authApi } from './services/api'
+
+// Detect Telegram Desktop where auth might not work
+const isTelegramDesktop = () => {
+  const webApp = window.Telegram?.WebApp
+  if (!webApp) return false
+  // Desktop platforms: tdesktop, macos, linux, windows
+  const platform = webApp.platform?.toLowerCase()
+  return platform && ['tdesktop', 'macos', 'linux', 'windows', 'desktop'].some(p => platform.includes(p))
+}
 
 // Auth Context
 const AuthContext = createContext({
@@ -27,8 +40,8 @@ export const useAuth = () => useContext(AuthContext)
 
 const tabs = [
   { id: 'dashboard', icon: LayoutDashboard, label: 'Home' },
+  { id: 'history', icon: Zap, label: 'Positions' },
   { id: 'whales', icon: Search, label: 'Whales' },
-  { id: 'history', icon: History, label: 'History' },
   { id: 'alerts', icon: Bell, label: 'Alerts', badge: 3 },
   { id: 'settings', icon: Settings, label: 'Settings' },
 ]
@@ -41,6 +54,17 @@ function App() {
     user: null,
     loading: true,
   })
+
+  // Listen for navigation events (e.g., from PremiumBanner)
+  useEffect(() => {
+    const handleNavigate = (event) => {
+      if (event.detail && typeof event.detail === 'string') {
+        setActiveTab(event.detail)
+      }
+    }
+    window.addEventListener('navigate', handleNavigate)
+    return () => window.removeEventListener('navigate', handleNavigate)
+  }, [])
 
   useEffect(() => {
     const initAuth = async () => {
@@ -97,6 +121,8 @@ function App() {
         return <Dashboard />
       case 'whales':
         return <WhaleDiscovery />
+      case 'stats':
+        return <Statistics />
       case 'history':
         return <TradeHistory />
       case 'alerts':
@@ -113,6 +139,7 @@ function App() {
   }
 
   return (
+    <ErrorBoundary>
     <AuthContext.Provider value={authState}>
     <div className="min-h-screen flex flex-col relative">
       {/* Animated Ocean Background */}
@@ -157,7 +184,7 @@ function App() {
       </div>
 
       {/* Main Content */}
-      <main className="flex-1 overflow-y-auto overflow-x-hidden pb-24">
+      <main className="flex-1 overflow-y-auto overflow-x-hidden pb-36">
         <AnimatePresence mode="wait">
           <motion.div
             key={activeTab}
@@ -225,6 +252,7 @@ function App() {
       </nav>
     </div>
     </AuthContext.Provider>
+    </ErrorBoundary>
   )
 }
 

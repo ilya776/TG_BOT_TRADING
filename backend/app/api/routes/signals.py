@@ -8,6 +8,7 @@ from decimal import Decimal
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload, joinedload
 
 from app.api.deps import CurrentUser, DbSession, OptionalUser
 from app.models.signal import (
@@ -111,20 +112,27 @@ async def list_signals(
     result = await db.execute(query)
     signals = result.scalars().all()
 
+    # Get all whale IDs for batch loading (prevents N+1 queries)
+    whale_ids = list(set(s.whale_id for s in signals))
+
+    # Batch load whales
+    whales_result = await db.execute(
+        select(Whale).where(Whale.id.in_(whale_ids))
+    )
+    whales_map = {w.id: w for w in whales_result.scalars().all()}
+
+    # Batch load whale stats
+    stats_result = await db.execute(
+        select(WhaleStats).where(WhaleStats.whale_id.in_(whale_ids))
+    )
+    stats_map = {s.whale_id: s.win_rate for s in stats_result.scalars().all()}
+
     # Build responses with whale info
     responses = []
     for signal in signals:
-        # Get whale info
-        whale_result = await db.execute(
-            select(Whale).where(Whale.id == signal.whale_id)
-        )
-        whale = whale_result.scalar_one_or_none()
-
-        # Get whale stats for win rate
-        stats_result = await db.execute(
-            select(WhaleStats.win_rate).where(WhaleStats.whale_id == signal.whale_id)
-        )
-        win_rate = stats_result.scalar()
+        # Get whale info from batch-loaded data
+        whale = whales_map.get(signal.whale_id)
+        win_rate = stats_map.get(signal.whale_id)
 
         # Calculate auto_copy_in (10 seconds if pending and auto-copy enabled)
         auto_copy_in = 0
@@ -223,11 +231,17 @@ async def get_signal(
     )
 
 
+class CopySignalRequest(BaseModel):
+    size_usdt: Decimal | None = None
+    exchange: str | None = None
+
+
 @router.post("/{signal_id}/copy", status_code=status.HTTP_202_ACCEPTED)
 async def copy_signal(
     signal_id: int,
     current_user: CurrentUser,
     db: DbSession,
+    body: CopySignalRequest | None = None,
 ) -> dict:
     """Manually copy a signal trade."""
     result = await db.execute(
@@ -253,16 +267,45 @@ async def copy_signal(
             detail="Token not available on supported CEX",
         )
 
-    # TODO: Queue trade execution via Celery
-    # For now, just mark as processed
-    signal.status = SignalStatus.PROCESSED
+    # Check if user has API keys configured
+    from app.models.user import UserAPIKey
+    api_key_result = await db.execute(
+        select(UserAPIKey).where(
+            UserAPIKey.user_id == current_user.id,
+            UserAPIKey.is_active == True
+        )
+    )
+    api_key = api_key_result.scalar_one_or_none()
+
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please configure exchange API keys in Settings first",
+        )
+
+    # Queue trade execution via Celery
+    from app.workers.tasks.trade_tasks import execute_copy_trade
+    signal.status = SignalStatus.PROCESSING
     signal.processed_at = datetime.utcnow()
     await db.commit()
 
+    # Execute the copy trade asynchronously with optional size/exchange override
+    trade_params = {}
+    if body:
+        if body.size_usdt:
+            trade_params["size_usdt"] = float(body.size_usdt)
+        if body.exchange:
+            trade_params["exchange"] = body.exchange.upper()
+
+    execute_copy_trade.delay(signal_id, user_id=current_user.id, **trade_params)
+
     return {
-        "message": "Trade copy initiated",
+        "message": "Trade copy initiated - executing on exchange",
         "signal_id": signal_id,
         "symbol": signal.cex_symbol,
+        "status": "processing",
+        "size_usdt": float(body.size_usdt) if body and body.size_usdt else None,
+        "exchange": body.exchange if body else None,
     }
 
 

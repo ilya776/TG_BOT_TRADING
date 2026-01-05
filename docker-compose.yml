@@ -47,8 +47,11 @@ services:
       redis-server
       --appendonly yes
       --requirepass ${REDIS_PASSWORD}
-      --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory 512mb
+      --maxmemory-policy volatile-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
     # Production: Don't expose ports externally
     # ports:
     #   - "6379:6379"
@@ -71,6 +74,9 @@ services:
       dockerfile: Dockerfile
     container_name: whale_backend
     restart: unless-stopped
+    # Graceful shutdown: wait for ongoing requests to complete
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
     environment:
       # Database
       - DATABASE_URL=postgresql+asyncpg://postgres:${DB_PASSWORD}@postgres:5432/whale_copy_trading
@@ -112,6 +118,12 @@ services:
     command: >
       sh -c "alembic upgrade head &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     networks:
       - whale_internal
     deploy:
@@ -128,6 +140,10 @@ services:
       dockerfile: Dockerfile
     container_name: whale_celery_worker
     restart: unless-stopped
+    # CRITICAL: Long grace period to prevent trade interruption
+    # Trades can take up to 30s on exchange, give 60s total for cleanup
+    stop_grace_period: 60s
+    stop_signal: SIGTERM
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:${DB_PASSWORD}@postgres:5432/whale_copy_trading
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
@@ -148,13 +164,19 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4 -Q celery,trades,notifications,whales --max-tasks-per-child=1000
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.workers.celery_app", "inspect", "ping", "-d", "celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     networks:
       - whale_internal
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 1024M
 
   # ===========================================
   # Celery Beat Scheduler
@@ -165,6 +187,9 @@ services:
       dockerfile: Dockerfile
     container_name: whale_celery_beat
     restart: unless-stopped
+    # Graceful shutdown for Beat scheduler
+    stop_grace_period: 15s
+    stop_signal: SIGTERM
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:${DB_PASSWORD}@postgres:5432/whale_copy_trading
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
@@ -176,7 +201,15 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: celery -A app.workers.celery_app beat --loglevel=info
+    # Beat with pidfile for health check
+    command: celery -A app.workers.celery_app beat --loglevel=info --pidfile=/tmp/celerybeat.pid
+    # Health check: verify Beat is running by checking pidfile
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/celerybeat.pid"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     networks:
       - whale_internal
     deploy:
@@ -217,6 +250,9 @@ services:
       dockerfile: Dockerfile
     container_name: whale_monitor
     restart: unless-stopped
+    # Graceful shutdown for blockchain listener
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:${DB_PASSWORD}@postgres:5432/whale_copy_trading
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
@@ -255,7 +291,13 @@ services:
     expose:
       - "80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     networks:
       - whale_internal
     deploy:

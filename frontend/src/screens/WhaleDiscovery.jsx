@@ -220,27 +220,34 @@ function WhaleDiscoveryCard({ whale, index, onClick, onFollow, onUnfollow }) {
   const chartData = whale.chart_data?.map((value) => ({ value })) ||
     [40, 45, 42, 55, 60, 58, 65, 70, 68, 75, 80, 85].map(v => ({ value: v }))
 
-  // Map backend fields to frontend expectations
-  const weeklyPnl = whale.stats?.profit_7d || whale.stats?.pnl_7d_percent || 0
-  const winRate = parseFloat(whale.stats?.win_rate || 0)
-  const totalProfit = parseFloat(whale.stats?.total_profit_usd || whale.stats?.total_pnl || 0)
+  // Map backend fields - API returns strings, convert to numbers safely
+  // Use avg_profit_percent for ROI percentage (profit_7d is USD value)
+  const weeklyPnlRaw = Number(whale.stats?.avg_profit_percent)
+  const weeklyPnl = isNaN(weeklyPnlRaw) ? 0 : weeklyPnlRaw
+  const winRateRaw = Number(whale.stats?.win_rate)
+  const winRate = isNaN(winRateRaw) ? 0 : winRateRaw
+  const totalProfit = Number(whale.stats?.total_profit_usd) || Number(whale.stats?.avg_profit_percent) * 100 || 0
   const followers = whale.followers_count || 0
 
-  // Parse tags - backend returns string like "tag1,tag2", frontend expects array
-  const tags = typeof whale.tags === 'string' && whale.tags
-    ? whale.tags.split(',').map(t => t.trim())
-    : (Array.isArray(whale.tags) ? whale.tags : [])
+  // Parse tags - backend returns null or string "tag1,tag2"
+  const tags = whale.tags && typeof whale.tags === 'string'
+    ? whale.tags.split(',').map(t => t.trim()).filter(Boolean)
+    : []
 
   const handleFollowClick = async (e) => {
     e.stopPropagation()
+    const previousState = isFollowing
+    // Optimistic update
+    setIsFollowing(!isFollowing)
     try {
-      if (isFollowing) {
+      if (previousState) {
         await onUnfollow()
       } else {
         await onFollow()
       }
-      setIsFollowing(!isFollowing)
     } catch (err) {
+      // Rollback on error
+      setIsFollowing(previousState)
       console.error('Follow error:', err)
     }
   }
@@ -375,28 +382,35 @@ function WhaleDetailModal({ whale, onClose, onFollow, onUnfollow, onUpdateFollow
   const chartData = whale.chart_data?.map((value) => ({ value })) ||
     [40, 45, 42, 55, 60, 58, 65, 70, 68, 75, 80, 85].map(v => ({ value: v }))
 
-  // Map backend fields to frontend expectations
-  const weeklyPnl = parseFloat(whale.stats?.profit_7d || whale.stats?.pnl_7d_percent || 0)
-  const winRate = parseFloat(whale.stats?.win_rate || 0)
-  const totalProfit = parseFloat(whale.stats?.total_profit_usd || whale.stats?.total_pnl || 0)
+  // Map backend fields - API returns strings, convert to numbers safely
+  // Use avg_profit_percent for ROI percentage (profit_7d is USD value)
+  const weeklyPnlRaw = Number(whale.stats?.avg_profit_percent)
+  const weeklyPnl = isNaN(weeklyPnlRaw) ? 0 : weeklyPnlRaw
+  const winRateRaw = Number(whale.stats?.win_rate)
+  const winRate = isNaN(winRateRaw) ? 0 : winRateRaw
+  const totalProfit = Number(whale.stats?.total_profit_usd) || Number(whale.stats?.avg_profit_percent) * 100 || 0
   const totalTrades = whale.stats?.total_trades || 0
   const followers = whale.followers_count || 0
 
-  // Parse tags - backend returns string like "tag1,tag2", frontend expects array
-  const tags = typeof whale.tags === 'string' && whale.tags
-    ? whale.tags.split(',').map(t => t.trim())
-    : (Array.isArray(whale.tags) ? whale.tags : [])
+  // Parse tags - backend returns null or string "tag1,tag2"
+  const tags = whale.tags && typeof whale.tags === 'string'
+    ? whale.tags.split(',').map(t => t.trim()).filter(Boolean)
+    : []
 
   const handleAction = async () => {
     setIsLoading(true)
+    const previousState = isFollowing
+    // Optimistic update
+    setIsFollowing(!isFollowing)
     try {
-      if (isFollowing) {
+      if (previousState) {
         await onUnfollow()
       } else {
         await onFollow()
       }
-      setIsFollowing(!isFollowing)
     } catch (err) {
+      // Rollback on error
+      setIsFollowing(previousState)
       console.error('Action error:', err)
     } finally {
       setIsLoading(false)
@@ -404,6 +418,7 @@ function WhaleDetailModal({ whale, onClose, onFollow, onUnfollow, onUpdateFollow
   }
 
   const handleSettingsChange = async (key, value) => {
+    const previousSettings = { ...copySettings }
     const newSettings = { ...copySettings, [key]: value }
     setCopySettings(newSettings)
     if (isFollowing) {
@@ -413,6 +428,8 @@ function WhaleDetailModal({ whale, onClose, onFollow, onUnfollow, onUpdateFollow
           trade_size_usdt: newSettings.tradeSize,
         })
       } catch (err) {
+        // Rollback on error
+        setCopySettings(previousSettings)
         console.error('Update settings error:', err)
       }
     }

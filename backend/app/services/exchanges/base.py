@@ -114,6 +114,8 @@ class BaseExchange(ABC):
 
     All exchange implementations must inherit from this class
     and implement all abstract methods.
+
+    Includes circuit breaker integration for automatic failure tracking.
     """
 
     def __init__(
@@ -126,6 +128,17 @@ class BaseExchange(ABC):
         self.api_secret = api_secret
         self.testnet = testnet
         self._client: Any = None
+        self._circuit_breaker: Any = None  # Set by factory function
+
+    def record_success(self):
+        """Record successful API call for circuit breaker."""
+        if self._circuit_breaker:
+            self._circuit_breaker.record_success()
+
+    def record_failure(self, exception: Exception = None):
+        """Record failed API call for circuit breaker."""
+        if self._circuit_breaker:
+            self._circuit_breaker.record_failure(exception)
 
     @property
     @abstractmethod

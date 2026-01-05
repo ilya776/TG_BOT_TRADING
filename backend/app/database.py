@@ -18,13 +18,20 @@ from app.config import get_settings
 
 settings = get_settings()
 
-# Create async engine
+# Create async engine with statement timeout
+# statement_timeout: 30 seconds max for any query (prevents long-running queries)
 engine = create_async_engine(
     settings.database_url,
     echo=settings.database_echo,
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=20,
+    connect_args={
+        "server_settings": {
+            "statement_timeout": "30000",  # 30 seconds in milliseconds
+            "lock_timeout": "10000",  # 10 seconds for lock acquisition
+        }
+    },
 )
 
 # Create async session factory
@@ -46,8 +53,12 @@ sync_engine = create_engine(
     sync_database_url,
     echo=settings.database_echo,
     pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
+    pool_size=15,  # Increased for Celery workers (was 5)
+    max_overflow=15,  # Increased for peak load (was 10)
+    pool_recycle=3600,  # Recycle connections every hour
+    connect_args={
+        "options": "-c statement_timeout=30000 -c lock_timeout=10000"
+    },
 )
 
 # Sync session factory for Celery

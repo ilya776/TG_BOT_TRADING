@@ -2,7 +2,7 @@
 Database Models
 """
 
-from app.models.user import User, UserSettings, UserAPIKey
+from app.models.user import User, UserSettings, UserAPIKey, UserExchangeBalance
 from app.models.whale import Whale, WhaleStats, UserWhaleFollow
 from app.models.trade import Trade, Position
 from app.models.signal import WhaleSignal
@@ -12,6 +12,7 @@ __all__ = [
     "User",
     "UserSettings",
     "UserAPIKey",
+    "UserExchangeBalance",
     "Whale",
     "WhaleStats",
     "UserWhaleFollow",

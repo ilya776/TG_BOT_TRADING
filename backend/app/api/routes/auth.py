@@ -33,6 +33,16 @@ class TelegramAuthRequest(BaseModel):
     init_data: str
 
 
+class TelegramDesktopAuthRequest(BaseModel):
+    """Request body for Telegram Desktop fallback authentication."""
+    telegram_id: int
+    username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+    language_code: str = "en"
+    platform: str = "unknown"  # For logging/audit
+
+
 class AuthResponse(BaseModel):
     """Response containing authentication tokens."""
     access_token: str
@@ -259,6 +269,123 @@ async def authenticate_telegram_header(
     # Use the same logic as the POST body endpoint
     request = TelegramAuthRequest(init_data=x_telegram_init_data)
     return await authenticate_telegram(request, db)
+
+
+@router.post("/telegram/desktop", response_model=AuthResponse)
+async def authenticate_telegram_desktop(
+    request: TelegramDesktopAuthRequest,
+    db: DbSession,
+):
+    """
+    Fallback authentication for Telegram Desktop where initData is empty.
+
+    SECURITY: This endpoint only allows authentication for EXISTING users.
+    New user creation is disabled to prevent account enumeration attacks.
+
+    Additional protections:
+    - Rate limiting (configured in Caddy: 10 req/min per IP)
+    - Only existing users can authenticate (no account creation)
+    - Audit logging for security monitoring
+    - Can be disabled via DISABLE_DESKTOP_AUTH=true environment variable
+    """
+    # Check if desktop auth is disabled (recommended for production)
+    if settings.disable_desktop_auth:
+        logger.warning(
+            "Desktop auth attempt blocked (disabled)",
+            telegram_id=request.telegram_id,
+            platform=request.platform,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Desktop authentication is disabled. Please use Telegram mobile app.",
+        )
+
+    logger.warning(
+        "Desktop fallback auth attempt",
+        telegram_id=request.telegram_id,
+        platform=request.platform,
+        username=request.username,
+    )
+
+    if not request.telegram_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Telegram user ID",
+        )
+
+    # Basic validation: telegram_id must be positive integer
+    if request.telegram_id <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Telegram user ID",
+        )
+
+    # SECURITY: Only allow existing users to authenticate via desktop
+    # This prevents attackers from creating accounts with arbitrary telegram_ids
+    result = await db.execute(
+        select(User).where(User.telegram_id == request.telegram_id)
+    )
+    user = result.scalar_one_or_none()
+
+    if not user:
+        logger.warning(
+            "Desktop auth rejected - user not found",
+            telegram_id=request.telegram_id,
+            platform=request.platform,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found. Please authenticate via Telegram mobile app first.",
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is deactivated",
+        )
+
+    if user.is_banned:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"User account is banned: {user.ban_reason or 'No reason provided'}",
+        )
+
+    # Update user info if provided
+    if request.username:
+        user.username = request.username
+    if request.first_name:
+        user.first_name = request.first_name
+    if request.last_name:
+        user.last_name = request.last_name
+    user.language_code = request.language_code
+    user.last_active_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(user)
+
+    # Generate tokens
+    jwt_manager = get_jwt_manager()
+    access_token = jwt_manager.create_access_token({"user_id": user.id})
+    refresh_token = jwt_manager.create_refresh_token({"user_id": user.id})
+
+    logger.info(
+        "User authenticated via Telegram Desktop fallback",
+        user_id=user.id,
+        telegram_id=request.telegram_id,
+        platform=request.platform,
+    )
+
+    return AuthResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        user={
+            "id": user.id,
+            "telegram_id": user.telegram_id,
+            "username": user.username,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "subscription_tier": user.subscription_tier.value,
+        }
+    )
 
 
 @router.post("/refresh", response_model=AuthResponse)

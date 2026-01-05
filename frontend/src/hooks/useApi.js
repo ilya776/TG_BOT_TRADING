@@ -2,8 +2,8 @@
  * React hooks for API integration
  */
 
-import { useState, useEffect, useCallback } from 'react';
-import { userApi, whalesApi, tradesApi, signalsApi, SignalWebSocket, authApi } from '../services/api';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { userApi, whalesApi, tradesApi, signalsApi, balanceApi, SignalWebSocket, authApi } from '../services/api';
 
 // Demo data for unauthenticated users
 const DEMO_PORTFOLIO = {
@@ -128,31 +128,87 @@ const DEMO_SIGNALS = [
   },
 ];
 
+// ==================== ABORT CONTROLLER HELPER ====================
+
+/**
+ * Create an AbortController with cleanup function
+ * Usage: const { signal, cleanup } = createAbortController(abortControllerRef)
+ */
+function createAbortController(ref) {
+  // Cancel any in-flight request
+  if (ref.current) {
+    ref.current.abort();
+  }
+
+  // Create new controller
+  const controller = new AbortController();
+  ref.current = controller;
+
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      if (ref.current === controller) {
+        ref.current.abort();
+        ref.current = null;
+      }
+    },
+  };
+}
+
+/**
+ * Check if error is an abort error (should be ignored)
+ */
+function isAbortError(err) {
+  return err.name === 'AbortError' || err.message === 'Aborted';
+}
+
 // ==================== GENERIC HOOKS ====================
 
 /**
- * Generic hook for fetching data
+ * Generic hook for fetching data with AbortController support
  */
 export function useFetch(fetchFn, deps = []) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const abortControllerRef = useRef(null);
+  const isMountedRef = useRef(true);
 
   const refetch = useCallback(async () => {
     setLoading(true);
     setError(null);
+
+    // Create abort controller for this request
+    const { signal, cleanup } = createAbortController(abortControllerRef);
+
     try {
-      const result = await fetchFn();
-      setData(result);
+      const result = await fetchFn({ signal });
+      if (isMountedRef.current && !signal.aborted) {
+        setData(result);
+      }
     } catch (err) {
-      setError(err.message);
+      if (isAbortError(err)) return; // Ignore abort errors
+      if (isMountedRef.current) {
+        setError(err.message);
+      }
     } finally {
-      setLoading(false);
+      if (isMountedRef.current && !signal.aborted) {
+        setLoading(false);
+      }
     }
   }, [fetchFn]);
 
   useEffect(() => {
+    isMountedRef.current = true;
     refetch();
+
+    return () => {
+      isMountedRef.current = false;
+      // Cancel any in-flight request on unmount
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
   }, deps);
 
   return { data, loading, error, refetch };
@@ -324,31 +380,89 @@ export function useApiKeys() {
 // ==================== WHALE HOOKS ====================
 
 /**
- * Hook for whale list with filtering
+ * Hook for fetching whales with debounced search and AbortController
+ *
+ * Features:
+ * - Debouncing prevents excessive API calls when user types in search field
+ * - AbortController cancels in-flight requests when new request is made
+ * - Non-search params (chain, sortBy) trigger immediate fetch
  */
 export function useWhales(params = {}) {
   const [whales, setWhales] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const debounceTimerRef = useRef(null);
+  const abortControllerRef = useRef(null);
+  const lastSearchRef = useRef(params.search);
+  const isMountedRef = useRef(true);
 
-  const fetchWhales = useCallback(async () => {
+  const fetchWhales = useCallback(async (fetchParams) => {
+    // Cancel previous request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setLoading(true);
     try {
-      const data = await whalesApi.getWhales(params);
-      setWhales(data.items || data);
-      setError(null);
+      const data = await whalesApi.getWhales(fetchParams, { signal: controller.signal });
+      if (isMountedRef.current && !controller.signal.aborted) {
+        setWhales(data.items || data);
+        setError(null);
+      }
     } catch (err) {
-      setError(err.message);
+      if (isAbortError(err)) return; // Ignore abort errors
+      if (isMountedRef.current) {
+        setError(err.message);
+      }
     } finally {
-      setLoading(false);
+      if (isMountedRef.current && !controller.signal.aborted) {
+        setLoading(false);
+      }
     }
-  }, [JSON.stringify(params)]);
+  }, []);
 
   useEffect(() => {
-    fetchWhales();
-  }, [fetchWhales]);
+    isMountedRef.current = true;
 
-  return { whales, loading, error, refetch: fetchWhales };
+    // Clear any pending debounce timer
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+
+    // Check if search param changed
+    const searchChanged = params.search !== lastSearchRef.current;
+    lastSearchRef.current = params.search;
+
+    // Debounce only for search changes (500ms delay)
+    // Other param changes (chain, sortBy) trigger immediate fetch
+    if (searchChanged && params.search) {
+      setLoading(true); // Show loading immediately for UX
+      debounceTimerRef.current = setTimeout(() => {
+        fetchWhales(params);
+      }, 500);
+    } else {
+      // Immediate fetch for non-search params or empty search
+      fetchWhales(params);
+    }
+
+    // Cleanup on unmount
+    return () => {
+      isMountedRef.current = false;
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, [JSON.stringify(params), fetchWhales]);
+
+  const refetch = useCallback(() => fetchWhales(params), [fetchWhales, params]);
+
+  return { whales, loading, error, refetch };
 }
 
 /**
@@ -507,6 +621,7 @@ export function usePositions() {
   const [positions, setPositions] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const isMountedRef = useRef(true);
 
   const fetchPositions = useCallback(async () => {
     // Skip if not authenticated
@@ -519,9 +634,13 @@ export function usePositions() {
     setLoading(true);
     try {
       const data = await tradesApi.getPositions();
-      setPositions(Array.isArray(data) ? data : []);
-      setError(null);
+      // Only update state if component is still mounted
+      if (isMountedRef.current) {
+        setPositions(Array.isArray(data) ? data : []);
+        setError(null);
+      }
     } catch (err) {
+      if (!isMountedRef.current) return;
       if (err.message?.includes('401') || err.message?.includes('authorization')) {
         setPositions([]);
         setError(null);
@@ -529,9 +648,11 @@ export function usePositions() {
         setError(err.message);
       }
     } finally {
-      setLoading(false);
+      if (isMountedRef.current) {
+        setLoading(false);
+      }
     }
-  }, []);
+  }, []); // Empty deps - stable reference
 
   const updatePosition = useCallback(async (positionId, updates) => {
     if (!authApi.isAuthenticated()) {
@@ -552,16 +673,24 @@ export function usePositions() {
     setPositions((prev) => prev.filter((p) => p.id !== positionId));
   }, []);
 
+  // Cleanup on unmount
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
   useEffect(() => {
     fetchPositions();
-  }, [fetchPositions]);
+  }, []); // Run once on mount
 
   // Auto-refresh positions every 10 seconds (only if authenticated)
   useEffect(() => {
     if (!authApi.isAuthenticated()) return;
     const interval = setInterval(fetchPositions, 10000);
     return () => clearInterval(interval);
-  }, [fetchPositions]);
+  }, []); // Stable - no deps needed
 
   return { positions, loading, error, refetch: fetchPositions, updatePosition, closePosition };
 }
@@ -573,47 +702,231 @@ export function usePortfolio() {
   return useFetch(tradesApi.getPortfolio);
 }
 
+// ==================== BALANCE HOOKS ====================
+
+/**
+ * Hook for exchange balances
+ * Returns balances for all connected exchanges
+ */
+export function useBalances() {
+  const [balances, setBalances] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [syncing, setSyncing] = useState({});
+
+  const fetchBalances = useCallback(async () => {
+    // Skip if not authenticated
+    if (!authApi.isAuthenticated()) {
+      setBalances({
+        total_usdt: '0',
+        available_usdt: '0',
+        exchanges: [],
+      });
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const data = await balanceApi.getBalances();
+      setBalances(data);
+      setError(null);
+    } catch (err) {
+      if (err.message?.includes('401') || err.message?.includes('authorization')) {
+        setBalances({
+          total_usdt: '0',
+          available_usdt: '0',
+          exchanges: [],
+        });
+        setError(null);
+      } else {
+        setError(err.message);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const syncBalance = useCallback(async (exchange) => {
+    if (!authApi.isAuthenticated()) {
+      throw new Error('Please login via Telegram to sync balances');
+    }
+
+    setSyncing(prev => ({ ...prev, [exchange]: true }));
+    try {
+      const result = await balanceApi.syncBalance(exchange);
+      // Refresh all balances after sync
+      await fetchBalances();
+      return result;
+    } finally {
+      setSyncing(prev => ({ ...prev, [exchange]: false }));
+    }
+  }, [fetchBalances]);
+
+  useEffect(() => {
+    fetchBalances();
+  }, [fetchBalances]);
+
+  // Auto-refresh every 60 seconds
+  useEffect(() => {
+    if (!authApi.isAuthenticated()) return;
+    const interval = setInterval(fetchBalances, 60000);
+    return () => clearInterval(interval);
+  }, [fetchBalances]);
+
+  return {
+    balances,
+    loading,
+    error,
+    syncing,
+    refetch: fetchBalances,
+    fetchBalances, // Alias for backwards compatibility
+    syncBalance,
+  };
+}
+
 // ==================== LIVE SIGNALS HOOK ====================
 
 /**
- * Hook for real-time whale signals via WebSocket
+ * Hook for real-time whale signals via WebSocket with HTTP polling fallback
+ *
+ * Strategy:
+ * 1. Try to connect via WebSocket for real-time updates
+ * 2. If WebSocket fails after max retries, fall back to HTTP polling
+ * 3. HTTP polling runs every 10 seconds when WebSocket is unavailable
  */
 export function useLiveSignals() {
   const [signals, setSignals] = useState([]);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState(null);
+  const [usingFallback, setUsingFallback] = useState(false);
+  const wsRef = useRef(null);
+  const pollingIntervalRef = useRef(null);
+  const isMountedRef = useRef(true);
+  const usingFallbackRef = useRef(false); // Ref to avoid stale closure in interval
+
+  // Fetch signals via HTTP (used for initial load and fallback polling)
+  const fetchSignals = useCallback(async () => {
+    try {
+      const data = await signalsApi.getSignals({ limit: 50 });
+      if (isMountedRef.current) {
+        setSignals(data || []);
+        setError(null);
+      }
+    } catch (err) {
+      if (isMountedRef.current) {
+        setError(err.message);
+      }
+    }
+  }, []);
+
+  // Start HTTP polling as fallback
+  const startPolling = useCallback(() => {
+    if (pollingIntervalRef.current) return; // Already polling
+
+    console.log('Starting HTTP polling fallback for signals');
+    setUsingFallback(true);
+    usingFallbackRef.current = true;
+
+    // Immediate fetch
+    fetchSignals();
+
+    // Poll every 10 seconds
+    pollingIntervalRef.current = setInterval(fetchSignals, 10000);
+  }, [fetchSignals]);
+
+  // Stop HTTP polling
+  const stopPolling = useCallback(() => {
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+      setUsingFallback(false);
+      usingFallbackRef.current = false;
+    }
+  }, []);
 
   useEffect(() => {
+    isMountedRef.current = true;
+
     const handleMessage = (signal) => {
+      if (!isMountedRef.current) return;
       setSignals((prev) => [signal, ...prev].slice(0, 50)); // Keep last 50 signals
     };
 
     const handleError = (err) => {
+      if (!isMountedRef.current) return;
       setError(err);
       setConnected(false);
     };
 
-    const ws = new SignalWebSocket(handleMessage, handleError);
-    ws.connect();
+    const handleConnectionFailed = (message) => {
+      if (!isMountedRef.current) return;
+      console.warn('WebSocket connection failed:', message);
+      setConnected(false);
+      setError(message);
 
-    // Initial fetch of recent signals
-    signalsApi.getSignals({ limit: 20 })
-      .then((data) => setSignals(data))
-      .catch((err) => setError(err.message));
+      // Start HTTP polling as fallback
+      startPolling();
+    };
+
+    // Called when WebSocket reconnects after fallback started
+    const handleReconnected = () => {
+      if (!isMountedRef.current) return;
+      console.log('WebSocket reconnected, stopping HTTP polling');
+      stopPolling();
+      setConnected(true);
+      setError(null);
+    };
+
+    // Create WebSocket with fallback and reconnect handlers
+    wsRef.current = new SignalWebSocket(
+      handleMessage,
+      handleError,
+      handleConnectionFailed,
+      handleReconnected
+    );
+
+    // Try WebSocket first
+    wsRef.current.connect();
+
+    // Track connection state (less frequent since we have proper callbacks now)
+    const checkConnection = setInterval(() => {
+      if (!isMountedRef.current) return;
+      const isConnected = wsRef.current?.isConnected() || false;
+      setConnected(isConnected);
+    }, 5000); // Check every 5s instead of 2s
+
+    // Initial fetch of signals (regardless of WebSocket status)
+    fetchSignals();
 
     return () => {
-      ws.disconnect();
+      isMountedRef.current = false;
+      clearInterval(checkConnection);
+      stopPolling();
+      if (wsRef.current) {
+        wsRef.current.disconnect();
+        wsRef.current = null;
+      }
     };
-  }, []);
+  }, []); // Empty deps - run once on mount
 
-  return { signals, connected, error };
+  // Retry WebSocket connection manually
+  const retryConnection = useCallback(() => {
+    stopPolling();
+    setError(null);
+    if (wsRef.current) {
+      wsRef.current.reset();
+    }
+  }, [stopPolling]);
+
+  return { signals, connected, error, usingFallback, retryConnection };
 }
 
 // ==================== COMBINED DASHBOARD HOOK ====================
 
 /**
  * Hook for dashboard data (combines multiple API calls)
- * Returns demo data if user is not authenticated
+ * Shows REAL data - whales are public, positions/trades empty if not authenticated
  */
 export function useDashboard() {
   const [data, setData] = useState({
@@ -625,6 +938,7 @@ export function useDashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [isDemo, setIsDemo] = useState(false);
+  const isMountedRef = useRef(true);
 
   const fetchDashboard = useCallback(async () => {
     setLoading(true);
@@ -632,59 +946,74 @@ export function useDashboard() {
     const isAuthenticated = authApi.isAuthenticated();
 
     try {
-      // Whales leaderboard is public - always fetch real data
-      const whales = await whalesApi.getLeaderboard('7d').catch(() => DEMO_WHALES);
+      // Whales leaderboard is public - always fetch REAL data
+      const whales = await whalesApi.getLeaderboard('7d').catch(() => []);
+
+      if (!isMountedRef.current) return; // Check before state updates
 
       if (isAuthenticated) {
         // Authenticated: fetch all user-specific data
         const [portfolio, positions, trades] = await Promise.all([
-          tradesApi.getPortfolio().catch(() => DEMO_PORTFOLIO),
+          tradesApi.getPortfolio().catch(() => null),
           tradesApi.getPositions().catch(() => []),
           tradesApi.getTrades({ limit: 5 }).catch(() => []),
         ]);
 
+        if (!isMountedRef.current) return;
+
         setData({
-          portfolio,
-          positions,
-          topWhales: whales.slice ? whales.slice(0, 3) : whales,
-          recentTrades: trades.items || trades,
+          portfolio: portfolio || { total_value_usdt: 0, daily_pnl: 0, daily_pnl_percent: 0 },
+          positions: positions || [],
+          topWhales: Array.isArray(whales) ? whales.slice(0, 3) : [],
+          recentTrades: trades?.items || trades || [],
         });
         setIsDemo(false);
       } else {
-        // Not authenticated: show real whales, demo portfolio/positions
+        // Not authenticated: show REAL whales, empty portfolio/positions (user has none)
         setData({
-          portfolio: DEMO_PORTFOLIO,
-          positions: DEMO_POSITIONS,
-          topWhales: whales.slice ? whales.slice(0, 3) : DEMO_WHALES,
-          recentTrades: DEMO_TRADES,
+          portfolio: { total_value_usdt: 0, daily_pnl: 0, daily_pnl_percent: 0, total_positions: 0 },
+          positions: [],
+          topWhales: Array.isArray(whales) ? whales.slice(0, 3) : [],
+          recentTrades: [],
         });
         setIsDemo(true);
       }
       setError(null);
     } catch (err) {
-      // Fallback to demo on any error
+      if (!isMountedRef.current) return;
+      console.error('Dashboard fetch error:', err);
       setData({
-        portfolio: DEMO_PORTFOLIO,
-        positions: DEMO_POSITIONS,
-        topWhales: DEMO_WHALES,
-        recentTrades: DEMO_TRADES,
+        portfolio: { total_value_usdt: 0, daily_pnl: 0, daily_pnl_percent: 0, total_positions: 0 },
+        positions: [],
+        topWhales: [],
+        recentTrades: [],
       });
       setIsDemo(true);
-      setError(null);
+      setError(err.message);
     } finally {
-      setLoading(false);
+      if (isMountedRef.current) {
+        setLoading(false);
+      }
     }
+  }, []); // Empty deps - stable reference
+
+  // Cleanup on unmount
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
   }, []);
 
   useEffect(() => {
     fetchDashboard();
-  }, [fetchDashboard]);
+  }, []); // Run once on mount
 
   // Auto-refresh every 30 seconds
   useEffect(() => {
     const interval = setInterval(fetchDashboard, 30000);
     return () => clearInterval(interval);
-  }, [fetchDashboard]);
+  }, []); // Stable - no deps needed
 
   return { ...data, loading, error, isDemo, refetch: fetchDashboard };
 }

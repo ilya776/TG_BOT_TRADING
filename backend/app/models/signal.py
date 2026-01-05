@@ -38,6 +38,7 @@ class SignalConfidence(str, Enum):
 
 class SignalStatus(str, Enum):
     PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
     PROCESSED = "PROCESSED"
     EXPIRED = "EXPIRED"
     FAILED = "FAILED"

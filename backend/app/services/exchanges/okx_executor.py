@@ -171,13 +171,13 @@ class OKXExecutor(BaseExchange):
                 # OKX uses 'cost' for quote order quantity in market orders
                 response = await client.create_market_buy_order(
                     symbol,
-                    float(quantity),
+                    str(quantity),  # Use str to preserve Decimal precision
                     params={**params, "quoteOrderQty": str(quote_order_qty)},
                 )
             else:
                 response = await client.create_market_buy_order(
                     symbol,
-                    float(quantity),
+                    str(quantity),  # Use str to preserve Decimal precision
                     params=params,
                 )
             return self._parse_order_result(response)
@@ -196,7 +196,7 @@ class OKXExecutor(BaseExchange):
         try:
             response = await client.create_market_sell_order(
                 symbol,
-                float(quantity),
+                str(quantity),  # Use str to preserve Decimal precision
                 params={"tdMode": "cash"},
             )
             return self._parse_order_result(response)
@@ -216,8 +216,8 @@ class OKXExecutor(BaseExchange):
         try:
             response = await client.create_limit_buy_order(
                 symbol,
-                float(quantity),
-                float(price),
+                str(quantity),  # Use str to preserve Decimal precision
+                str(price),  # Use str to preserve Decimal precision
                 params={"tdMode": "cash"},
             )
             return self._parse_order_result(response)
@@ -237,8 +237,8 @@ class OKXExecutor(BaseExchange):
         try:
             response = await client.create_limit_sell_order(
                 symbol,
-                float(quantity),
-                float(price),
+                str(quantity),  # Use str to preserve Decimal precision
+                str(price),  # Use str to preserve Decimal precision
                 params={"tdMode": "cash"},
             )
             return self._parse_order_result(response)
@@ -285,7 +285,7 @@ class OKXExecutor(BaseExchange):
             client.options["defaultType"] = "swap"
             response = await client.create_market_buy_order(
                 symbol,
-                float(quantity),
+                str(quantity),  # Use str to preserve Decimal precision
                 params={
                     "tdMode": "cross",
                     "posSide": "long",
@@ -310,7 +310,7 @@ class OKXExecutor(BaseExchange):
             client.options["defaultType"] = "swap"
             response = await client.create_market_sell_order(
                 symbol,
-                float(quantity),
+                str(quantity),  # Use str to preserve Decimal precision
                 params={
                     "tdMode": "cross",
                     "posSide": "short",
@@ -349,7 +349,7 @@ class OKXExecutor(BaseExchange):
             if position_side == PositionSide.LONG:
                 response = await client.create_market_sell_order(
                     symbol,
-                    float(quantity),
+                    str(quantity),  # Use str to preserve Decimal precision
                     params={
                         "tdMode": "cross",
                         "posSide": "long",
@@ -359,7 +359,7 @@ class OKXExecutor(BaseExchange):
             else:
                 response = await client.create_market_buy_order(
                     symbol,
-                    float(quantity),
+                    str(quantity),  # Use str to preserve Decimal precision
                     params={
                         "tdMode": "cross",
                         "posSide": "short",

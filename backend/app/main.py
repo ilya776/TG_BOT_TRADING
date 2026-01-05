@@ -12,7 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import auth, users, whales, trades, subscriptions, webhooks, signals
+from app.api.routes import auth, users, whales, trades, subscriptions, webhooks, signals, balance
 from app.config import get_settings
 from app.database import close_db, init_db
 
@@ -148,6 +148,7 @@ app.include_router(
 )
 app.include_router(webhooks.router, prefix="/webhook", tags=["Webhooks"])
 app.include_router(signals.router, prefix="/api/v1/signals", tags=["Signals"])
+app.include_router(balance.router, prefix="/api/v1", tags=["Balance"])
 
 
 # Health check endpoint

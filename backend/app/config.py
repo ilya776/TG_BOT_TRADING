@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     telegram_webhook_url: str | None = None
     telegram_webapp_url: str | None = None
 
+    # Security: Disable desktop auth in production (no cryptographic verification)
+    disable_desktop_auth: bool = False
+
     # Encryption
     encryption_key: str = Field(..., min_length=32)
 
@@ -108,15 +111,15 @@ def get_settings() -> Settings:
 SUBSCRIPTION_TIERS = {
     "FREE": {
         "price_monthly": 0,
-        "whales_limit": 1,
-        "auto_copy": False,
+        "whales_limit": 5,
+        "auto_copy": True,
         "commission_rate": 0.02,
         "futures_enabled": False,
-        "max_positions": 3,
+        "max_positions": 5,
         "features": [
-            "Manual copy only",
+            "Auto-copy enabled",
             "Basic analytics",
-            "1 whale to follow",
+            "5 whales to follow",
         ],
     },
     "PRO": {

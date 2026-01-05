@@ -167,13 +167,13 @@ class BybitExecutor(BaseExchange):
             if quote_order_qty:
                 response = await client.create_market_buy_order(
                     symbol,
-                    float(quantity),
+                    str(quantity),  # Use str to preserve Decimal precision
                     params={"quoteOrderQty": str(quote_order_qty)},
                 )
             else:
                 response = await client.create_market_buy_order(
                     symbol,
-                    float(quantity),
+                    str(quantity),  # Use str to preserve Decimal precision
                 )
             return self._parse_order_result(response)
         except ccxt.BaseError as e:
@@ -192,7 +192,7 @@ class BybitExecutor(BaseExchange):
             client.options["defaultType"] = "spot"
             response = await client.create_market_sell_order(
                 symbol,
-                float(quantity),
+                str(quantity),  # Use str to preserve Decimal precision
             )
             return self._parse_order_result(response)
         except ccxt.BaseError as e:
@@ -212,8 +212,8 @@ class BybitExecutor(BaseExchange):
             client.options["defaultType"] = "spot"
             response = await client.create_limit_buy_order(
                 symbol,
-                float(quantity),
-                float(price),
+                str(quantity),  # Use str to preserve Decimal precision
+                str(price),  # Use str to preserve Decimal precision
             )
             return self._parse_order_result(response)
         except ccxt.BaseError as e:
@@ -233,8 +233,8 @@ class BybitExecutor(BaseExchange):
             client.options["defaultType"] = "spot"
             response = await client.create_limit_sell_order(
                 symbol,
-                float(quantity),
-                float(price),
+                str(quantity),  # Use str to preserve Decimal precision
+                str(price),  # Use str to preserve Decimal precision
             )
             return self._parse_order_result(response)
         except ccxt.BaseError as e:
@@ -285,7 +285,7 @@ class BybitExecutor(BaseExchange):
             client.options["defaultType"] = "linear"
             response = await client.create_market_buy_order(
                 symbol,
-                float(quantity),
+                str(quantity),  # Use str to preserve Decimal precision
                 params={"positionIdx": 1},  # One-way mode
             )
             client.options["defaultType"] = "spot"
@@ -307,7 +307,7 @@ class BybitExecutor(BaseExchange):
             client.options["defaultType"] = "linear"
             response = await client.create_market_sell_order(
                 symbol,
-                float(quantity),
+                str(quantity),  # Use str to preserve Decimal precision
                 params={"positionIdx": 2},  # One-way mode
             )
             client.options["defaultType"] = "spot"
@@ -343,7 +343,7 @@ class BybitExecutor(BaseExchange):
             if position_side == PositionSide.LONG:
                 response = await client.create_market_sell_order(
                     symbol,
-                    float(quantity),
+                    str(quantity),  # Use str to preserve Decimal precision
                     params={
                         "positionIdx": 1,
                         "reduceOnly": True,
@@ -352,7 +352,7 @@ class BybitExecutor(BaseExchange):
             else:
                 response = await client.create_market_buy_order(
                     symbol,
-                    float(quantity),
+                    str(quantity),  # Use str to preserve Decimal precision
                     params={
                         "positionIdx": 2,
                         "reduceOnly": True,

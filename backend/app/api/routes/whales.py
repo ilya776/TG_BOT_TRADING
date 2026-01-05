@@ -148,25 +148,28 @@ async def list_whales(
         )
         followed_ids = {row[0] for row in follows_result.all()}
 
-    # Get followers count for each whale
+    # Batch load followers count for each whale (prevents N+1)
+    whale_ids = [w.id for w in whales]
     followers_query = await db.execute(
         select(
             UserWhaleFollow.whale_id,
             func.count(UserWhaleFollow.id).label("count"),
         )
-        .where(UserWhaleFollow.whale_id.in_([w.id for w in whales]))
+        .where(UserWhaleFollow.whale_id.in_(whale_ids))
         .group_by(UserWhaleFollow.whale_id)
     )
     followers_counts = {row[0]: row[1] for row in followers_query.all()}
 
-    # Build response
+    # Batch load all stats for whales (prevents N+1 query)
+    stats_result = await db.execute(
+        select(WhaleStats).where(WhaleStats.whale_id.in_(whale_ids))
+    )
+    stats_map = {s.whale_id: s for s in stats_result.scalars().all()}
+
+    # Build response (no additional queries in loop)
     responses = []
     for whale in whales:
-        # Load stats
-        stats_result = await db.execute(
-            select(WhaleStats).where(WhaleStats.whale_id == whale.id)
-        )
-        stats = stats_result.scalar_one_or_none()
+        stats = stats_map.get(whale.id)
 
         responses.append(
             WhaleWithStatsResponse(
@@ -225,12 +228,28 @@ async def get_whale_leaderboard(
         )
         followed_ids = {row[0] for row in follows_result.all()}
 
+    # Batch load all stats for whales (prevents N+1 query)
+    whale_ids = [w.id for w in whales]
+    stats_result = await db.execute(
+        select(WhaleStats).where(WhaleStats.whale_id.in_(whale_ids))
+    )
+    stats_map = {s.whale_id: s for s in stats_result.scalars().all()}
+
+    # Batch load followers count
+    followers_query = await db.execute(
+        select(
+            UserWhaleFollow.whale_id,
+            func.count(UserWhaleFollow.id).label("count"),
+        )
+        .where(UserWhaleFollow.whale_id.in_(whale_ids))
+        .group_by(UserWhaleFollow.whale_id)
+    )
+    followers_counts = {row[0]: row[1] for row in followers_query.all()}
+
+    # Build response (no additional queries in loop)
     responses = []
     for whale in whales:
-        stats_result = await db.execute(
-            select(WhaleStats).where(WhaleStats.whale_id == whale.id)
-        )
-        stats = stats_result.scalar_one_or_none()
+        stats = stats_map.get(whale.id)
 
         responses.append(
             WhaleWithStatsResponse(
@@ -246,7 +265,7 @@ async def get_whale_leaderboard(
                 created_at=whale.created_at,
                 stats=WhaleStatsResponse.model_validate(stats) if stats else None,
                 is_following=whale.id in followed_ids,
-                followers_count=0,
+                followers_count=followers_counts.get(whale.id, 0),
             )
         )
 

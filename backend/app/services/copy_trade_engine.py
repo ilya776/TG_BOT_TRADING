@@ -10,8 +10,9 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import OperationalError
 
 from app.config import SUBSCRIPTION_TIERS
 from app.database import get_db_context
@@ -27,7 +28,7 @@ from app.models.trade import (
 )
 from app.models.user import User, UserAPIKey, UserSettings
 from app.models.whale import UserWhaleFollow
-from app.services.exchanges import get_exchange_executor
+from app.services.exchanges import get_exchange_executor, CircuitOpenError
 from app.services.risk_manager import RiskManager
 from app.utils.encryption import get_encryption_manager
 
@@ -64,12 +65,21 @@ class CopyTradeEngine:
         self.db = db
         self.encryption = get_encryption_manager()
 
-    async def process_signal(self, signal: WhaleSignal) -> list[CopyTradeResult]:
+    async def process_signal(
+        self,
+        signal: WhaleSignal,
+        user_id: int | None = None,
+        size_usdt_override: Decimal | None = None,
+        exchange_override: str | None = None,
+    ) -> list[CopyTradeResult]:
         """
         Process a whale signal and execute copy trades.
 
         Args:
             signal: The whale signal to process
+            user_id: Optional specific user ID (for manual copy)
+            size_usdt_override: Optional trade size override
+            exchange_override: Optional exchange override (BINANCE, BYBIT, OKX)
 
         Returns:
             List of CopyTradeResult for each user
@@ -83,11 +93,15 @@ class CopyTradeEngine:
             await self.db.commit()
             return results
 
-        # Get all users following this whale with auto-copy enabled
-        followers = await self._get_auto_copy_followers(signal.whale_id)
+        # If specific user_id provided (manual copy), process only that user
+        if user_id:
+            followers = await self._get_specific_user_for_copy(user_id, signal.whale_id)
+        else:
+            # Get all users following this whale with auto-copy enabled
+            followers = await self._get_auto_copy_followers(signal.whale_id)
 
         if not followers:
-            logger.info(f"No auto-copy followers for whale {signal.whale_id}")
+            logger.info(f"No followers to process for whale {signal.whale_id}")
             signal.status = SignalStatus.PROCESSED
             await self.db.commit()
             return results
@@ -97,11 +111,17 @@ class CopyTradeEngine:
         # Process each follower
         for follow, user, settings in followers:
             try:
+                # Apply overrides if provided
+                effective_size = size_usdt_override or None
+                effective_exchange = exchange_override or None
+
                 result = await self._execute_copy_trade(
                     signal=signal,
                     follow=follow,
                     user=user,
                     settings=settings,
+                    size_usdt_override=effective_size,
+                    exchange_override=effective_exchange,
                 )
                 results.append(result)
 
@@ -137,21 +157,69 @@ class CopyTradeEngine:
         )
         return list(result.all())
 
+    async def _get_specific_user_for_copy(
+        self,
+        user_id: int,
+        whale_id: int,
+    ) -> list[tuple[UserWhaleFollow, User, UserSettings | None]]:
+        """Get a specific user for manual copy (regardless of auto_copy setting)."""
+        result = await self.db.execute(
+            select(UserWhaleFollow, User, UserSettings)
+            .join(User, UserWhaleFollow.user_id == User.id)
+            .outerjoin(UserSettings, User.id == UserSettings.user_id)
+            .where(
+                UserWhaleFollow.user_id == user_id,
+                UserWhaleFollow.whale_id == whale_id,
+                User.is_active == True,
+                User.is_banned == False,
+            )
+        )
+        followers = list(result.all())
+
+        # If user is not following this whale, still allow manual copy
+        if not followers:
+            user_result = await self.db.execute(
+                select(User, UserSettings)
+                .outerjoin(UserSettings, User.id == UserSettings.user_id)
+                .where(
+                    User.id == user_id,
+                    User.is_active == True,
+                    User.is_banned == False,
+                )
+            )
+            user_data = user_result.first()
+            if user_data:
+                user, settings = user_data
+                # Create a dummy follow object for manual copy
+                dummy_follow = UserWhaleFollow(
+                    user_id=user_id,
+                    whale_id=whale_id,
+                    auto_copy_enabled=False,
+                )
+                return [(dummy_follow, user, settings)]
+
+        return followers
+
     async def _execute_copy_trade(
         self,
         signal: WhaleSignal,
         follow: UserWhaleFollow,
         user: User,
         settings: UserSettings | None,
+        size_usdt_override: Decimal | None = None,
+        exchange_override: str | None = None,
     ) -> CopyTradeResult:
         """Execute a copy trade for a single user."""
-        # Determine trade size
-        trade_size_usdt = await self._calculate_trade_size(
-            follow=follow,
-            user=user,
-            settings=settings,
-            signal=signal,
-        )
+        # Determine trade size (use override if provided)
+        if size_usdt_override:
+            trade_size_usdt = size_usdt_override
+        else:
+            trade_size_usdt = await self._calculate_trade_size(
+                follow=follow,
+                user=user,
+                settings=settings,
+                signal=signal,
+            )
 
         if trade_size_usdt <= 0:
             return CopyTradeResult(
@@ -200,7 +268,7 @@ class CopyTradeEngine:
         if api_key.passphrase_encrypted:
             decrypted_passphrase = self.encryption.decrypt(api_key.passphrase_encrypted)
 
-        # Initialize exchange executor
+        # Initialize exchange executor with circuit breaker protection
         try:
             executor = get_exchange_executor(
                 exchange_name=exchange.value.lower(),
@@ -211,94 +279,193 @@ class CopyTradeEngine:
             )
             await executor.initialize()
 
+        except CircuitOpenError as e:
+            # Exchange is temporarily unavailable due to circuit breaker
+            logger.warning(f"Circuit breaker open for {exchange.value}: {e}")
+            return CopyTradeResult(
+                success=False,
+                error=f"Exchange {exchange.value} temporarily unavailable. Retry in {e.time_remaining:.0f}s",
+            )
         except Exception as e:
             return CopyTradeResult(
                 success=False,
                 error=f"Failed to initialize exchange: {e}",
             )
 
+        # === CRITICAL: 2-PHASE COMMIT PATTERN ===
+        # To prevent orphaned trades and ensure recoverability:
+        #
+        # PHASE 1 (Reserve): Lock user → Create PENDING trade → Reserve balance → COMMIT
+        # EXCHANGE CALL: Execute on exchange (if crash here, PENDING trade exists for reconciliation)
+        # PHASE 2 (Confirm/Rollback): Update trade to FILLED/FAILED → Update position → COMMIT
+        #
+        # Benefits:
+        # - If crash before Phase 1 commit: Nothing saved, clean state
+        # - If crash after Phase 1 but before exchange: PENDING trade can be cancelled
+        # - If crash after exchange but before Phase 2: PENDING trade can be reconciled with exchange
+        # - If crash after Phase 2: Fully consistent state
+
+        trade = None
+        order_result = None
+
         try:
-            # Get current price to calculate quantity
-            current_price = await executor.get_ticker_price(signal.cex_symbol)
-            if not current_price:
+            # ============================================
+            # PHASE 1: RESERVE (Atomic reservation)
+            # ============================================
+            try:
+                locked_user_result = await self.db.execute(
+                    select(User)
+                    .where(User.id == user.id)
+                    .with_for_update(nowait=True)
+                )
+                locked_user = locked_user_result.scalar_one_or_none()
+
+                if not locked_user:
+                    return CopyTradeResult(success=False, error="User not found")
+
+                if locked_user.available_balance < trade_size_usdt:
+                    return CopyTradeResult(
+                        success=False,
+                        error=f"Insufficient balance: {locked_user.available_balance} < {trade_size_usdt}",
+                    )
+
+            except OperationalError as lock_error:
+                logger.warning(f"Trade locked for user {user.id}: {lock_error}")
                 return CopyTradeResult(
                     success=False,
-                    error="Could not get current price",
+                    error="Another trade is in progress. Please wait and try again.",
                 )
+
+            # Get current price for quantity calculation
+            current_price = await executor.get_ticker_price(signal.cex_symbol)
+            if not current_price:
+                return CopyTradeResult(success=False, error="Could not get current price")
 
             quantity = trade_size_usdt / current_price
 
-            # Execute the trade
-            if signal.action.value == "BUY":
-                if is_futures:
-                    order_result = await executor.futures_market_long(
-                        symbol=signal.cex_symbol,
-                        quantity=quantity,
-                    )
-                else:
-                    order_result = await executor.spot_market_buy(
-                        symbol=signal.cex_symbol,
-                        quantity=quantity,
-                    )
-            else:  # SELL
-                if is_futures:
-                    order_result = await executor.futures_market_short(
-                        symbol=signal.cex_symbol,
-                        quantity=quantity,
-                    )
-                else:
-                    order_result = await executor.spot_market_sell(
-                        symbol=signal.cex_symbol,
-                        quantity=quantity,
-                    )
-
-            # Create trade record
+            # Create PENDING trade record (reservation)
             trade = Trade(
                 user_id=user.id,
                 signal_id=signal.id,
                 whale_id=signal.whale_id,
                 is_copy_trade=True,
                 exchange=exchange.value,
-                exchange_order_id=order_result.order_id,
+                exchange_order_id=None,  # Will be set after exchange call
                 symbol=signal.cex_symbol,
                 trade_type=TradeType.FUTURES if is_futures else TradeType.SPOT,
                 side=TradeSide.BUY if signal.action.value == "BUY" else TradeSide.SELL,
                 order_type=OrderType.MARKET,
                 quantity=quantity,
-                filled_quantity=order_result.filled_quantity,
-                executed_price=order_result.avg_fill_price,
+                filled_quantity=Decimal("0"),
+                executed_price=None,
                 trade_value_usdt=trade_size_usdt,
                 leverage=leverage if is_futures else None,
-                fee_amount=order_result.fee,
-                fee_currency=order_result.fee_currency,
-                status=TradeStatus.FILLED if order_result.is_filled else TradeStatus.PARTIALLY_FILLED,
-                executed_at=datetime.utcnow(),
+                status=TradeStatus.PENDING,  # Will be updated after exchange call
             )
             self.db.add(trade)
+
+            # Reserve balance (deduct from available)
+            locked_user.available_balance -= trade_size_usdt
+
+            # COMMIT PHASE 1 - reservation is now durable
+            await self.db.commit()
+            await self.db.refresh(trade)
+
+            logger.info(
+                f"Phase 1 complete: Trade {trade.id} reserved for user {user.id}, "
+                f"{trade_size_usdt} USDT reserved"
+            )
+
+            # ============================================
+            # EXCHANGE CALL (Between phases - recoverable)
+            # ============================================
+            try:
+                # Update trade status to EXECUTING
+                trade.status = TradeStatus.EXECUTING
+                await self.db.commit()
+
+                if signal.action.value == "BUY":
+                    if is_futures:
+                        order_result = await executor.futures_market_long(
+                            symbol=signal.cex_symbol,
+                            quantity=quantity,
+                        )
+                    else:
+                        order_result = await executor.spot_market_buy(
+                            symbol=signal.cex_symbol,
+                            quantity=quantity,
+                        )
+                else:  # SELL
+                    if is_futures:
+                        order_result = await executor.futures_market_short(
+                            symbol=signal.cex_symbol,
+                            quantity=quantity,
+                        )
+                    else:
+                        order_result = await executor.spot_market_sell(
+                            symbol=signal.cex_symbol,
+                            quantity=quantity,
+                        )
+
+                # Record success for circuit breaker
+                executor.record_success()
+
+            except Exception as exchange_error:
+                # Record failure for circuit breaker (may open circuit after threshold)
+                executor.record_failure(exchange_error)
+
+                # Exchange call failed - rollback the reservation
+                logger.error(f"Exchange call failed for trade {trade.id}: {exchange_error}")
+                trade.status = TradeStatus.FAILED
+                trade.error_message = str(exchange_error)[:500]
+                # Restore reserved balance
+                locked_user_result = await self.db.execute(
+                    select(User).where(User.id == user.id).with_for_update()
+                )
+                user_to_restore = locked_user_result.scalar_one()
+                user_to_restore.available_balance += trade_size_usdt
+                await self.db.commit()
+
+                return CopyTradeResult(
+                    success=False,
+                    trade_id=trade.id,
+                    error=f"Exchange error: {exchange_error}",
+                )
+
+            # ============================================
+            # PHASE 2: CONFIRM (Finalize successful trade)
+            # ============================================
+            # Update trade with exchange results
+            trade.exchange_order_id = order_result.order_id
+            trade.filled_quantity = order_result.filled_quantity
+            trade.executed_price = order_result.avg_fill_price
+            trade.fee_amount = order_result.fee
+            trade.fee_currency = order_result.fee_currency
+            trade.status = TradeStatus.FILLED if order_result.is_filled else TradeStatus.PARTIALLY_FILLED
+            trade.executed_at = datetime.utcnow()
 
             # Create or update position
             position = await self._create_or_update_position(
                 trade=trade,
-                user=user,
+                user=locked_user,
                 signal=signal,
                 order_result=order_result,
                 is_futures=is_futures,
                 leverage=leverage,
             )
 
-            # Update user's balance
-            user.available_balance -= trade_size_usdt
-
             # Update follow statistics
             follow.trades_copied += 1
 
+            # COMMIT PHASE 2 - trade is now complete
             await self.db.commit()
             await self.db.refresh(trade)
             await self.db.refresh(position)
 
             logger.info(
-                f"Copy trade executed for user {user.id}: "
-                f"{signal.action.value} {quantity} {signal.cex_symbol} at {order_result.avg_fill_price}"
+                f"Phase 2 complete: Trade {trade.id} filled for user {user.id}: "
+                f"{signal.action.value} {order_result.filled_quantity} {signal.cex_symbol} "
+                f"at {order_result.avg_fill_price}"
             )
 
             return CopyTradeResult(
@@ -308,7 +475,7 @@ class CopyTradeEngine:
                 details={
                     "symbol": signal.cex_symbol,
                     "side": signal.action.value,
-                    "quantity": str(quantity),
+                    "quantity": str(order_result.filled_quantity),
                     "price": str(order_result.avg_fill_price),
                     "value_usdt": str(trade_size_usdt),
                     "warnings": risk_check.warnings,
@@ -316,9 +483,30 @@ class CopyTradeEngine:
             )
 
         except Exception as e:
-            logger.error(f"Trade execution failed: {e}")
+            logger.error(f"Unexpected error in copy trade: {e}")
+
+            # If we have a trade record, mark it for reconciliation
+            if trade and trade.id:
+                try:
+                    # Use fresh session to avoid transaction issues
+                    async with get_db_context() as recovery_db:
+                        recovery_result = await recovery_db.execute(
+                            select(Trade).where(Trade.id == trade.id)
+                        )
+                        recovery_trade = recovery_result.scalar_one_or_none()
+                        if recovery_trade and recovery_trade.status in (
+                            TradeStatus.PENDING, TradeStatus.EXECUTING
+                        ):
+                            recovery_trade.status = TradeStatus.NEEDS_RECONCILIATION
+                            recovery_trade.error_message = f"Unexpected error: {str(e)[:400]}"
+                            await recovery_db.commit()
+                            logger.warning(f"Trade {trade.id} marked for reconciliation")
+                except Exception as recovery_error:
+                    logger.critical(f"Failed to mark trade for reconciliation: {recovery_error}")
+
             return CopyTradeResult(
                 success=False,
+                trade_id=trade.id if trade else None,
                 error=str(e),
             )
 
@@ -398,11 +586,13 @@ class CopyTradeEngine:
         leverage: int,
     ) -> Position:
         """Create a new position or update existing one."""
-        # Check for existing open position
+        # Check for existing open position FROM THE SAME WHALE
+        # This prevents merging positions from different whales on the same symbol
         existing = await self.db.execute(
             select(Position).where(
                 Position.user_id == user.id,
                 Position.symbol == signal.cex_symbol,
+                Position.whale_id == signal.whale_id,  # Only merge positions from same whale
                 Position.status == PositionStatus.OPEN,
             )
         )
@@ -446,12 +636,20 @@ class CopyTradeEngine:
         return position
 
 
-async def process_signal_async(signal_id: int) -> list[CopyTradeResult]:
+async def process_signal_async(
+    signal_id: int,
+    user_id: int | None = None,
+    size_usdt_override: Decimal | None = None,
+    exchange_override: str | None = None,
+) -> list[CopyTradeResult]:
     """
     Process a signal asynchronously (for use with Celery).
 
     Args:
         signal_id: ID of the signal to process
+        user_id: Optional specific user ID (for manual copy)
+        size_usdt_override: Optional trade size override
+        exchange_override: Optional exchange override (BINANCE, BYBIT, OKX)
 
     Returns:
         List of copy trade results
@@ -467,9 +665,16 @@ async def process_signal_async(signal_id: int) -> list[CopyTradeResult]:
             logger.error(f"Signal {signal_id} not found")
             return []
 
-        if signal.status != SignalStatus.PENDING:
-            logger.info(f"Signal {signal_id} already processed")
+        # Accept both PENDING and PROCESSING signals
+        # PROCESSING is set by check_whale_positions before this task runs
+        if signal.status not in (SignalStatus.PENDING, SignalStatus.PROCESSING):
+            logger.info(f"Signal {signal_id} already processed (status: {signal.status})")
             return []
 
         engine = CopyTradeEngine(db)
-        return await engine.process_signal(signal)
+        return await engine.process_signal(
+            signal,
+            user_id=user_id,
+            size_usdt_override=size_usdt_override,
+            exchange_override=exchange_override,
+        )
