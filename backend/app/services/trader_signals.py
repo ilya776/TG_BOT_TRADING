@@ -192,12 +192,14 @@ class TraderSignalService:
 
     async def fetch_bybit_trader_positions(self, leader_mark: str) -> list[TraderPosition]:
         """
-        Fetch current positions for a Bybit trader.
+        Fetch current positions for a Bybit copy trading leader.
+        Uses V5 API.
         """
         positions = []
 
         try:
-            url = "https://api2.bybit.com/fapi/beehive/public/v1/common/position/list"
+            # New V5 API endpoint
+            url = "https://api.bybit.com/v5/copy-trading/public/leader/positions"
 
             params = {
                 "leaderMark": leader_mark,
@@ -206,34 +208,92 @@ class TraderSignalService:
             response = await self.client.get(url, params=params)
 
             if response.status_code != 200:
-                logger.warning(f"Bybit positions API returned {response.status_code}")
+                logger.debug(f"Bybit positions API returned {response.status_code}")
                 return positions
 
             data = response.json()
-            result = data.get("result") or {}
-            position_list = result.get("list") or []
+            result = data.get("result", {})
+            position_list = result.get("list", []) if isinstance(result, dict) else []
 
             for item in position_list:
                 try:
+                    # Handle different field names
+                    size_val = item.get("size", item.get("qty", "0"))
                     position = TraderPosition(
                         symbol=item.get("symbol", ""),
-                        side=item.get("side", "LONG").upper(),
-                        entry_price=Decimal(str(item.get("entryPrice", 0))),
+                        side=item.get("side", "Buy").upper().replace("BUY", "LONG").replace("SELL", "SHORT"),
+                        entry_price=Decimal(str(item.get("avgEntryPrice", item.get("entryPrice", 0)))),
                         mark_price=Decimal(str(item.get("markPrice", 0))),
-                        size=Decimal(str(item.get("size", 0))),
+                        size=Decimal(str(size_val)),
                         pnl=Decimal(str(item.get("unrealisedPnl", 0))),
-                        roe=Decimal(str(item.get("unrealisedRoe", 0))),
-                        leverage=int(item.get("leverage", 1)),
+                        roe=Decimal(str(item.get("cumRealisedPnl", 0))),
+                        leverage=int(float(item.get("leverage", 1))),
                         update_time=datetime.utcnow()
                     )
                     positions.append(position)
                 except Exception as e:
                     logger.warning(f"Error parsing Bybit position: {e}")
 
-            logger.debug(f"Fetched {len(positions)} positions for Bybit trader {leader_mark[:8]}...")
+            if positions:
+                logger.info(f"Fetched {len(positions)} positions for Bybit trader {leader_mark[:8]}...")
 
         except Exception as e:
             logger.error(f"Error fetching Bybit trader positions: {e}")
+
+        return positions
+
+    async def fetch_bitget_trader_positions(self, trader_uid: str) -> list[TraderPosition]:
+        """
+        Fetch current positions for a Bitget copy trading master.
+        Bitget copy traders ALWAYS share positions publicly.
+        """
+        positions = []
+
+        try:
+            url = "https://api.bitget.com/api/mix/v1/copytrade/public/trader/current-track"
+
+            params = {
+                "traderUid": trader_uid,
+                "pageNo": "1",
+                "pageSize": "50"
+            }
+
+            response = await self.client.get(url, params=params)
+
+            if response.status_code != 200:
+                logger.debug(f"Bitget positions API returned {response.status_code}")
+                return positions
+
+            data = response.json()
+            position_list = data.get("data", {}).get("list", [])
+
+            for item in position_list:
+                try:
+                    # Bitget uses 'holdSide' for position side
+                    side = item.get("holdSide", "long").upper()
+                    if side not in ["LONG", "SHORT"]:
+                        side = "LONG" if "long" in side.lower() else "SHORT"
+
+                    position = TraderPosition(
+                        symbol=item.get("symbol", "").upper(),
+                        side=side,
+                        entry_price=Decimal(str(item.get("openPriceAvg", item.get("averageOpenPrice", 0)))),
+                        mark_price=Decimal(str(item.get("marketPrice", 0))),
+                        size=Decimal(str(item.get("total", item.get("holdAmount", 0)))),
+                        pnl=Decimal(str(item.get("unrealizedPL", 0))),
+                        roe=Decimal(str(item.get("achievedProfits", 0))) * 100,
+                        leverage=int(float(item.get("leverage", 1))),
+                        update_time=datetime.utcnow()
+                    )
+                    positions.append(position)
+                except Exception as e:
+                    logger.warning(f"Error parsing Bitget position: {e}")
+
+            if positions:
+                logger.info(f"Fetched {len(positions)} positions for Bitget trader {trader_uid[:8]}...")
+
+        except Exception as e:
+            logger.error(f"Error fetching Bitget trader positions: {e}")
 
         return positions
 
@@ -284,7 +344,9 @@ class TraderSignalService:
             result = await db.execute(
                 select(Whale).where(
                     Whale.is_active == True,
-                    Whale.wallet_address.like("binance_%") | Whale.wallet_address.like("bybit_%")
+                    Whale.wallet_address.like("binance_%") |
+                    Whale.wallet_address.like("bybit_%") |
+                    Whale.wallet_address.like("bitget_%")
                 ).order_by(Whale.score.desc()).limit(max_traders)
             )
             whales = result.scalars().all()
@@ -308,6 +370,8 @@ class TraderSignalService:
                         current_positions = await self.fetch_binance_trader_positions(uid)
                     elif exchange == "bybit":
                         current_positions = await self.fetch_bybit_trader_positions(uid)
+                    elif exchange == "bitget":
+                        current_positions = await self.fetch_bitget_trader_positions(uid)
                     else:
                         continue
 

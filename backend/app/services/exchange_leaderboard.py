@@ -68,7 +68,8 @@ class ExchangeLeaderboardService:
         # Fetch from each exchange in parallel
         results = await asyncio.gather(
             self.fetch_binance_leaderboard(limit=limit),
-            self.fetch_bybit_leaderboard(limit=limit),
+            self.fetch_bitget_copy_traders(limit=limit),
+            self.fetch_bybit_copy_traders(limit=limit),
             return_exceptions=True
         )
 
@@ -162,59 +163,117 @@ class ExchangeLeaderboardService:
 
         return None
 
-    async def fetch_bybit_leaderboard(self, limit: int = 50) -> list[TopTrader]:
+    async def fetch_bybit_copy_traders(self, limit: int = 50) -> list[TopTrader]:
         """
-        Fetch Bybit copy trading leaderboard.
+        Fetch Bybit copy trading master traders.
+        Uses the newer V5 API.
         """
         traders = []
 
         try:
-            # Bybit Copy Trading API
-            url = "https://api2.bybit.com/fapi/beehive/public/v1/common/leader/list"
+            # Bybit Copy Trading V5 API
+            url = "https://api.bybit.com/v5/copy-trading/public/leaders"
 
             params = {
-                "pageNo": 1,
-                "pageSize": min(limit, 50),
-                "sortType": "ROI",
-                "sortRule": "DESC",
-                "timeRange": "7D"
+                "limit": min(limit, 50),
+                "sortBy": "roi7D",
+                "sortType": "desc"
             }
 
             response = await self.client.get(url, params=params)
 
             if response.status_code != 200:
-                logger.warning(f"Bybit leaderboard API returned {response.status_code}")
+                logger.warning(f"Bybit copy trading API returned {response.status_code}")
                 return traders
 
             data = response.json()
             result = data.get("result", {})
-            leader_list = result.get("list", [])
+            leader_list = result.get("list", []) if isinstance(result, dict) else []
 
             for i, item in enumerate(leader_list[:limit]):
                 try:
                     trader = TopTrader(
-                        uid=str(item.get("leaderMark", "")),
-                        nickname=item.get("nickName", f"Bybit Trader #{i+1}"),
+                        uid=str(item.get("leaderMark", item.get("leaderId", ""))),
+                        nickname=item.get("nickName", f"Bybit Master #{i+1}"),
                         exchange="BYBIT",
-                        roi_7d=Decimal(str(item.get("roi7d", 0))),
-                        roi_30d=Decimal(str(item.get("roi30d", 0))),
-                        roi_90d=Decimal(str(item.get("roi90d", 0))),
-                        pnl_7d=Decimal(str(item.get("pnl7d", 0))),
-                        pnl_30d=Decimal(str(item.get("pnl30d", 0))),
+                        roi_7d=Decimal(str(item.get("roi7D", item.get("roi7d", 0)))),
+                        roi_30d=Decimal(str(item.get("roi30D", item.get("roi30d", 0)))),
+                        roi_90d=Decimal(str(item.get("roi90D", 0))),
+                        pnl_7d=Decimal(str(item.get("pnl7D", item.get("pnl7d", 0)))),
+                        pnl_30d=Decimal(str(item.get("pnl30D", 0))),
                         pnl_total=Decimal(str(item.get("totalPnl", 0))),
-                        win_rate=Decimal(str(item.get("winRate", 0))),
+                        win_rate=Decimal(str(item.get("winRate", 0))) * 100 if float(item.get("winRate", 0)) <= 1 else Decimal(str(item.get("winRate", 0))),
                         total_trades=int(item.get("totalTrades", 0)),
-                        followers_count=int(item.get("followerNum", 0)),
+                        followers_count=int(item.get("followerNum", item.get("currentFollowerNum", 0))),
                         rank=i + 1
                     )
                     traders.append(trader)
                 except Exception as e:
                     logger.warning(f"Error parsing Bybit trader: {e}")
 
-            logger.info(f"Fetched {len(traders)} traders from Bybit leaderboard")
+            logger.info(f"Fetched {len(traders)} traders from Bybit copy trading")
 
         except Exception as e:
-            logger.error(f"Error fetching Bybit leaderboard: {e}")
+            logger.error(f"Error fetching Bybit copy traders: {e}")
+
+        return traders
+
+    async def fetch_bitget_copy_traders(self, limit: int = 50) -> list[TopTrader]:
+        """
+        Fetch Bitget copy trading master traders.
+        These traders ALWAYS share positions publicly.
+        """
+        traders = []
+
+        try:
+            # Bitget Copy Trading public API
+            url = "https://api.bitget.com/api/mix/v1/copytrade/public/trader/ranking"
+
+            params = {
+                "pageNo": "1",
+                "pageSize": str(min(limit, 50)),
+                "sort": "WEEK_ROI"  # Sort by 7-day ROI
+            }
+
+            response = await self.client.get(url, params=params)
+
+            if response.status_code != 200:
+                logger.warning(f"Bitget copy trading API returned {response.status_code}")
+                return traders
+
+            data = response.json()
+            trader_list = data.get("data", {}).get("list", [])
+
+            for i, item in enumerate(trader_list[:limit]):
+                try:
+                    # Bitget returns ROI as decimal (0.15 = 15%)
+                    roi_7d = Decimal(str(item.get("weekRoi", item.get("roiWeek", 0)))) * 100
+                    roi_30d = Decimal(str(item.get("monthRoi", item.get("roiMonth", 0)))) * 100
+                    win_rate = Decimal(str(item.get("winRate", 0))) * 100 if float(item.get("winRate", 0)) <= 1 else Decimal(str(item.get("winRate", 0)))
+
+                    trader = TopTrader(
+                        uid=str(item.get("traderUid", item.get("traderId", ""))),
+                        nickname=item.get("traderName", item.get("nickName", f"Bitget Master #{i+1}")),
+                        exchange="BITGET",
+                        roi_7d=roi_7d,
+                        roi_30d=roi_30d,
+                        roi_90d=Decimal(str(item.get("totalRoi", 0))) * 100,
+                        pnl_7d=Decimal(str(item.get("weekPnl", item.get("pnlWeek", 0)))),
+                        pnl_30d=Decimal(str(item.get("monthPnl", 0))),
+                        pnl_total=Decimal(str(item.get("totalPnl", 0))),
+                        win_rate=win_rate,
+                        total_trades=int(item.get("totalTrade", item.get("tradeCount", 0))),
+                        followers_count=int(item.get("followerCount", item.get("copyCount", 0))),
+                        rank=i + 1
+                    )
+                    traders.append(trader)
+                except Exception as e:
+                    logger.warning(f"Error parsing Bitget trader: {e}")
+
+            logger.info(f"Fetched {len(traders)} traders from Bitget copy trading")
+
+        except Exception as e:
+            logger.error(f"Error fetching Bitget copy traders: {e}")
 
         return traders
 
