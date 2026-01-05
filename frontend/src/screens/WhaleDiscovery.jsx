@@ -17,6 +17,7 @@ import {
 import { AreaChart, Area, ResponsiveContainer } from 'recharts'
 import { useWhales, useFollowingWhales } from '../hooks/useApi'
 import { formatCurrency, formatLargeNumber, shortenAddress } from '../services/api'
+import { useToast } from '../components/Toast'
 
 const chains = [
   { id: 'all', name: 'All Chains', icon: '🌐' },
@@ -32,6 +33,7 @@ const sortOptions = [
 ]
 
 function WhaleDiscovery() {
+  const toast = useToast()
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedChain, setSelectedChain] = useState('all')
   const [selectedSort, setSelectedSort] = useState('score')
@@ -195,6 +197,7 @@ function WhaleDiscovery() {
             onClick={() => setSelectedWhale(whale)}
             onFollow={() => followWhale(whale.id)}
             onUnfollow={() => unfollowWhale(whale.id)}
+            toast={toast}
           />
         ))}
       </div>
@@ -208,6 +211,7 @@ function WhaleDiscovery() {
             onFollow={() => followWhale(selectedWhale.id)}
             onUnfollow={() => unfollowWhale(selectedWhale.id)}
             onUpdateFollow={(settings) => updateFollow(selectedWhale.id, settings)}
+            toast={toast}
           />
         )}
       </AnimatePresence>
@@ -215,7 +219,7 @@ function WhaleDiscovery() {
   )
 }
 
-function WhaleDiscoveryCard({ whale, index, onClick, onFollow, onUnfollow }) {
+function WhaleDiscoveryCard({ whale, index, onClick, onFollow, onUnfollow, toast }) {
   const [isFollowing, setIsFollowing] = useState(whale.isFollowing)
   const chartData = whale.chart_data?.map((value) => ({ value })) ||
     [40, 45, 42, 55, 60, 58, 65, 70, 68, 75, 80, 85].map(v => ({ value: v }))
@@ -248,6 +252,11 @@ function WhaleDiscoveryCard({ whale, index, onClick, onFollow, onUnfollow }) {
     } catch (err) {
       // Rollback on error
       setIsFollowing(previousState)
+      // Show error to user
+      const message = err?.message || 'Failed to follow whale'
+      if (toast) {
+        toast.error(message)
+      }
       console.error('Follow error:', err)
     }
   }
