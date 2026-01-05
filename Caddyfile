@@ -3,61 +3,26 @@
 # Automatic HTTPS with Let's Encrypt
 # ===========================================
 
-# Rate limiting configuration
-(rate_limit_api) {
-    rate_limit {
-        zone api_zone {
-            key {remote_host}
-            events 100
-            window 1m
-        }
-    }
-}
-
-(rate_limit_webhook) {
-    rate_limit {
-        zone webhook_zone {
-            key {remote_host}
-            events 30
-            window 1m
-        }
-    }
-}
-
-# Strict rate limiting for Desktop auth fallback (security measure)
-(rate_limit_desktop_auth) {
-    rate_limit {
-        zone desktop_auth_zone {
-            key {remote_host}
-            events 10
-            window 1m
-        }
-    }
-}
-
 snippetly.codes {
     # Enable compression
     encode gzip
 
-    # Telegram webhook endpoint with rate limiting
+    # Telegram webhook endpoint
     handle /webhook* {
-        import rate_limit_webhook
         reverse_proxy backend:8000
     }
 
-    # Desktop auth fallback - strict rate limiting (10 req/min)
+    # Desktop auth fallback
     handle /api/v1/auth/telegram/desktop {
-        import rate_limit_desktop_auth
         reverse_proxy backend:8000
     }
 
-    # API endpoints with rate limiting
+    # API endpoints
     handle /api/* {
-        import rate_limit_api
         reverse_proxy backend:8000
     }
 
-    # WebSocket endpoint (no rate limiting - long connections)
+    # WebSocket endpoint (long connections)
     handle /ws/* {
         reverse_proxy backend:8000 {
             transport http {
