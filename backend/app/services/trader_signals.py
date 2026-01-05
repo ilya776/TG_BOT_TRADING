@@ -137,6 +137,12 @@ class TraderSignalService:
 
             response = await self.client.post(url, json=payload)
 
+            if response.status_code == 429:
+                # Rate limited - wait and don't return empty (caller should retry later)
+                logger.warning(f"Binance positions API rate limited (429) - backing off")
+                await asyncio.sleep(5)  # Extra delay on rate limit
+                return positions
+
             if response.status_code != 200:
                 logger.warning(f"Binance positions API returned {response.status_code}")
                 return positions
@@ -346,9 +352,9 @@ class TraderSignalService:
                     # Update Redis cache
                     self._set_cached_positions(cache_key, current_positions)
 
-                    # Short delay to avoid rate limits (0.3 seconds between traders)
-                    # With 20 traders, this gives ~6s per full cycle
-                    await asyncio.sleep(0.3)
+                    # Delay to avoid rate limits (1.5 seconds between traders)
+                    # With 20 traders, this gives ~30s per full cycle, runs every 60s
+                    await asyncio.sleep(1.5)
 
                 except Exception as e:
                     logger.error(f"Error checking trader {whale.name}: {e}")

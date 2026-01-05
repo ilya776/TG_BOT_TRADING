@@ -154,11 +154,11 @@ celery_app.conf.update(
             "task": "app.workers.tasks.whale_tasks.sync_exchange_leaderboards",
             "schedule": 60.0,
         },
-        # Generate trading signals from trader positions every 5 seconds
-        # This is fast because it uses cached positions, just detects changes
+        # Generate trading signals from trader positions every 60 seconds
+        # Note: Each run checks 20 traders via Binance API - must be spaced to avoid 429 rate limits
         "generate-trader-signals": {
             "task": "app.workers.tasks.whale_tasks.generate_trader_signals",
-            "schedule": 5.0,
+            "schedule": 60.0,
         },
         # Update whale statistics every hour
         "update-whale-stats": {
