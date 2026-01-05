@@ -201,8 +201,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # Beat with pidfile for health check
-    command: celery -A app.workers.celery_app beat --loglevel=info --pidfile=/tmp/celerybeat.pid
+    # Beat with pidfile for health check (rm pidfile on start to prevent restart issues)
+    command: sh -c "rm -f /tmp/celerybeat.pid && celery -A app.workers.celery_app beat --loglevel=info --pidfile=/tmp/celerybeat.pid"
     # Health check: verify Beat is running by checking pidfile
     healthcheck:
       test: ["CMD", "test", "-f", "/tmp/celerybeat.pid"]
