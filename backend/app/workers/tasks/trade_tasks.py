@@ -731,13 +731,21 @@ def update_position_prices():
                                     for pos in exchange_positions:
                                         if pos.symbol == symbol:
                                             pos.current_price = price
-                                            pos.current_value_usdt = pos.remaining_quantity * price
+                                            # Use quantity if remaining_quantity is 0 (position not partially closed)
+                                            qty = pos.remaining_quantity if pos.remaining_quantity and pos.remaining_quantity > 0 else pos.quantity
+                                            pos.current_value_usdt = qty * price
 
                                             # Calculate unrealized PnL
                                             if pos.side.value == "BUY":
-                                                pos.unrealized_pnl = (price - pos.entry_price) * pos.remaining_quantity
+                                                pos.unrealized_pnl = (price - pos.entry_price) * qty
                                             else:
-                                                pos.unrealized_pnl = (pos.entry_price - price) * pos.remaining_quantity
+                                                pos.unrealized_pnl = (pos.entry_price - price) * qty
+
+                                            # Calculate unrealized PnL percent
+                                            if pos.entry_price and pos.entry_price > 0:
+                                                pos.unrealized_pnl_percent = ((price - pos.entry_price) / pos.entry_price) * 100
+                                                if pos.side.value != "BUY":
+                                                    pos.unrealized_pnl_percent = -pos.unrealized_pnl_percent
 
                                             updated += 1
                             except Exception as e:

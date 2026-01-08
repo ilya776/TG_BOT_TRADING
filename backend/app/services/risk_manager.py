@@ -12,7 +12,13 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import SUBSCRIPTION_TIERS
+from app.config import (
+    SUBSCRIPTION_TIERS,
+    MIN_TRADING_BALANCE_USDT,
+    MIN_TRADE_SIZE_USDT,
+    TRADE_SIZE_BUFFER_PERCENT,
+    EXCHANGE_MIN_NOTIONAL,
+)
 from app.models.trade import Position, PositionStatus, Trade, TradeStatus
 from app.models.user import User, UserSettings
 
@@ -87,6 +93,21 @@ class RiskManager:
             return RiskCheckResult(
                 allowed=False,
                 reason="User account is not active",
+            )
+
+        # G2: Minimum balance check
+        if user.available_balance < Decimal(str(MIN_TRADING_BALANCE_USDT)):
+            return RiskCheckResult(
+                allowed=False,
+                reason=f"Balance ${user.available_balance} below minimum ${MIN_TRADING_BALANCE_USDT}. "
+                       f"Please deposit more funds to trade.",
+            )
+
+        # G1: Minimum trade size check
+        if trade_size_usdt < Decimal(str(MIN_TRADE_SIZE_USDT)):
+            return RiskCheckResult(
+                allowed=False,
+                reason=f"Trade size ${trade_size_usdt} below minimum ${MIN_TRADE_SIZE_USDT}.",
             )
 
         # Check 2: Futures permission
@@ -369,3 +390,88 @@ class RiskManager:
             )
         )
         return result.scalar() or 0
+
+    def calculate_safe_trade_size(
+        self,
+        balance: Decimal,
+        leverage: int,
+        exchange: str,
+        futures_type: str = "USD-M",
+        percent_of_balance: Decimal = Decimal("1"),  # Default 1% of balance
+    ) -> Decimal:
+        """
+        G1: Calculate safe trade size respecting exchange minimums.
+
+        Args:
+            balance: User's available balance
+            leverage: Leverage to use
+            exchange: Exchange name (binance, okx, bitget)
+            futures_type: "USD-M", "COIN-M", or "SPOT"
+            percent_of_balance: Percentage of balance to use (default 1%)
+
+        Returns:
+            Safe trade size in USDT (margin, not position value)
+        """
+        # Get exchange minimum
+        exchange_minimums = EXCHANGE_MIN_NOTIONAL.get(exchange.lower(), {})
+        min_notional = Decimal(str(exchange_minimums.get(futures_type, MIN_TRADE_SIZE_USDT)))
+
+        # Calculate minimum margin required (notional / leverage)
+        min_margin = min_notional / Decimal(leverage)
+
+        # Add buffer for fees and slippage
+        buffer = Decimal(str(1 + TRADE_SIZE_BUFFER_PERCENT / 100))
+        min_margin_with_buffer = min_margin * buffer
+
+        # User's default size (percent of balance)
+        user_size = balance * (percent_of_balance / Decimal("100"))
+
+        # Use larger of: minimum required OR user's percentage
+        base_size = max(min_margin_with_buffer, user_size)
+
+        # Cap at 10% of balance for risk management (max single trade)
+        max_size = balance * Decimal("0.10")
+
+        # Final size is minimum of calculated and max
+        final_size = min(base_size, max_size)
+
+        # Ensure at least minimum trade size
+        final_size = max(final_size, Decimal(str(MIN_TRADE_SIZE_USDT)))
+
+        # But never more than available balance
+        final_size = min(final_size, balance)
+
+        logger.info(
+            f"Smart sizing: balance=${balance}, leverage={leverage}x, "
+            f"exchange_min=${min_notional}, user_pct={percent_of_balance}%, "
+            f"calculated=${final_size}"
+        )
+
+        return final_size
+
+    def get_minimum_trade_size(
+        self,
+        exchange: str,
+        futures_type: str = "USD-M",
+        leverage: int = 1,
+    ) -> Decimal:
+        """
+        Get minimum trade size for exchange/market type.
+
+        Args:
+            exchange: Exchange name
+            futures_type: Market type
+            leverage: Leverage (to calculate margin from notional)
+
+        Returns:
+            Minimum margin size in USDT
+        """
+        exchange_minimums = EXCHANGE_MIN_NOTIONAL.get(exchange.lower(), {})
+        min_notional = Decimal(str(exchange_minimums.get(futures_type, MIN_TRADE_SIZE_USDT)))
+
+        # For futures, minimum margin = minimum notional / leverage
+        min_margin = min_notional / Decimal(leverage) if leverage > 1 else min_notional
+
+        # Add buffer
+        buffer = Decimal(str(1 + TRADE_SIZE_BUFFER_PERCENT / 100))
+        return min_margin * buffer

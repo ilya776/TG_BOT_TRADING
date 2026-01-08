@@ -85,6 +85,10 @@ class WhaleSignal(Base):
         String(20)
     )  # e.g., "PEPEUSDT"
     cex_available: Mapped[bool] = mapped_column(default=False)
+    futures_type: Mapped[str | None] = mapped_column(
+        String(10), default="USD-M"
+    )  # "USD-M" or "COIN-M"
+    leverage: Mapped[int | None] = mapped_column()  # Whale's leverage for copy_leverage feature
 
     # Signal quality
     confidence: Mapped[SignalConfidence] = mapped_column(

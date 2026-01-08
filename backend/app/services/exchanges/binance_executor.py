@@ -195,6 +195,52 @@ class BinanceExecutor(BaseExchange):
 
         return balances
 
+    async def transfer_spot_to_futures(self, amount: Decimal, asset: str = "USDT") -> bool:
+        """Transfer funds from spot to USDT-M futures wallet.
+
+        Args:
+            amount: Amount to transfer
+            asset: Asset to transfer (default USDT)
+
+        Returns:
+            True if successful, raises on error
+        """
+        client = self._ensure_client()
+
+        try:
+            # Type 1: Spot to USDT-M Futures
+            await client.futures_account_transfer(
+                asset=asset,
+                amount=str(amount),
+                type=1,  # 1 = Spot to USDT-M Futures
+            )
+            return True
+        except BinanceAPIException as e:
+            raise RuntimeError(f"Transfer to futures failed: {e.message}") from e
+
+    async def transfer_futures_to_spot(self, amount: Decimal, asset: str = "USDT") -> bool:
+        """Transfer funds from USDT-M futures to spot wallet.
+
+        Args:
+            amount: Amount to transfer
+            asset: Asset to transfer (default USDT)
+
+        Returns:
+            True if successful, raises on error
+        """
+        client = self._ensure_client()
+
+        try:
+            # Type 2: USDT-M Futures to Spot
+            await client.futures_account_transfer(
+                asset=asset,
+                amount=str(amount),
+                type=2,  # 2 = USDT-M Futures to Spot
+            )
+            return True
+        except BinanceAPIException as e:
+            raise RuntimeError(f"Transfer to spot failed: {e.message}") from e
+
     # ==================== SPOT TRADING ====================
 
     async def spot_market_buy(
@@ -326,8 +372,13 @@ class BinanceExecutor(BaseExchange):
                 symbol=symbol,
                 side="BUY",
                 type="MARKET",
-                quantity=str(self.round_quantity(symbol, quantity)),
+                quantity=str(self.round_quantity(symbol, quantity, is_futures=True)),
             )
+            # Re-query order to get fill data (create response may be incomplete)
+            order_id = response.get("orderId")
+            if order_id:
+                await asyncio.sleep(0.2)  # Brief pause for order to fill
+                response = await client.futures_get_order(symbol=symbol, orderId=order_id)
             return self._parse_order_result(response, is_futures=True)
         except BinanceAPIException as e:
             raise RuntimeError(f"Binance futures long failed: {e.message}") from e
@@ -346,8 +397,13 @@ class BinanceExecutor(BaseExchange):
                 symbol=symbol,
                 side="SELL",
                 type="MARKET",
-                quantity=str(self.round_quantity(symbol, quantity)),
+                quantity=str(self.round_quantity(symbol, quantity, is_futures=True)),
             )
+            # Re-query order to get fill data (create response may be incomplete)
+            order_id = response.get("orderId")
+            if order_id:
+                await asyncio.sleep(0.2)  # Brief pause for order to fill
+                response = await client.futures_get_order(symbol=symbol, orderId=order_id)
             return self._parse_order_result(response, is_futures=True)
         except BinanceAPIException as e:
             raise RuntimeError(f"Binance futures short failed: {e.message}") from e
@@ -385,7 +441,7 @@ class BinanceExecutor(BaseExchange):
                 symbol=symbol,
                 side=side,
                 type="MARKET",
-                quantity=str(self.round_quantity(symbol, quantity)),
+                quantity=str(self.round_quantity(symbol, quantity, is_futures=True)),
                 reduceOnly=True,
             )
             return self._parse_order_result(response, is_futures=True)
@@ -513,20 +569,125 @@ class BinanceExecutor(BaseExchange):
 
     # ==================== UTILITY ====================
 
-    def round_quantity(self, symbol: str, quantity: Decimal) -> Decimal:
-        """Round quantity to valid step size."""
+    # Known step sizes for common Binance futures symbols
+    FUTURES_STEP_SIZES = {
+        "BTCUSDT": Decimal("0.001"),
+        "ETHUSDT": Decimal("0.001"),
+        "BNBUSDT": Decimal("0.01"),
+        "SOLUSDT": Decimal("0.1"),
+        "XRPUSDT": Decimal("0.1"),
+        "DOGEUSDT": Decimal("1"),
+        "ADAUSDT": Decimal("1"),
+        "MATICUSDT": Decimal("1"),
+        "LINKUSDT": Decimal("0.1"),
+        "AVAXUSDT": Decimal("0.1"),
+        "DOTUSDT": Decimal("0.1"),
+        "LTCUSDT": Decimal("0.001"),
+        "ATOMUSDT": Decimal("0.01"),
+        "NEARUSDT": Decimal("0.1"),
+        "APTUSDT": Decimal("0.1"),
+        "ARBUSDT": Decimal("1"),
+        "OPUSDT": Decimal("0.1"),
+    }
+
+    def round_quantity(self, symbol: str, quantity: Decimal, is_futures: bool = False) -> Decimal:
+        """Round quantity to valid step size.
+
+        Args:
+            symbol: Trading symbol
+            quantity: Quantity to round
+            is_futures: Whether this is for futures trading (uses futures cache first)
+
+        Returns:
+            Rounded quantity. Raises ValueError if result is zero.
+        """
         symbol = self.normalize_symbol(symbol)
-        info = self._symbol_info_cache.get(symbol) or self._futures_symbol_info_cache.get(symbol)
+
+        # Check the appropriate cache first based on order type
+        if is_futures:
+            info = self._futures_symbol_info_cache.get(symbol) or self._symbol_info_cache.get(symbol)
+        else:
+            info = self._symbol_info_cache.get(symbol) or self._futures_symbol_info_cache.get(symbol)
+
+        result = quantity
+        step_size = None
 
         if info:
             for f in info.get("filters", []):
                 if f["filterType"] == "LOT_SIZE":
                     step_size = Decimal(str(f["stepSize"]))
                     if step_size > 0:
-                        return (quantity // step_size) * step_size
+                        result = (quantity // step_size) * step_size
+                        break
 
-        # Default precision
-        return quantity.quantize(Decimal("0.00001"))
+        # Fallback to known futures step sizes (only for futures)
+        if result == quantity and is_futures and symbol in self.FUTURES_STEP_SIZES:
+            step_size = self.FUTURES_STEP_SIZES[symbol]
+            result = (quantity // step_size) * step_size
+
+        # Default precision if no step size found
+        if result == quantity:
+            result = quantity.quantize(Decimal("0.001"))
+
+        # CRITICAL: Check for zero quantity - would cause order failure
+        if result <= 0:
+            raise ValueError(
+                f"Quantity {quantity} rounds to zero for {symbol} "
+                f"(step_size={step_size or 'default 0.001'}). "
+                f"Increase trade size or use different symbol."
+            )
+
+        return result
+
+    async def get_min_notional(self, symbol: str, is_futures: bool = False) -> Decimal:
+        """Get minimum notional value for a symbol.
+
+        Args:
+            symbol: Trading symbol
+            is_futures: Whether to check futures minimums
+
+        Returns:
+            Minimum notional value in quote currency (usually USDT)
+        """
+        symbol = self.normalize_symbol(symbol)
+
+        # Check appropriate cache
+        if is_futures:
+            info = self._futures_symbol_info_cache.get(symbol)
+        else:
+            info = self._symbol_info_cache.get(symbol)
+
+        # If not in cache, try to fetch
+        if not info:
+            client = self._ensure_client()
+            try:
+                if is_futures:
+                    exchange_info = await client.futures_exchange_info()
+                else:
+                    exchange_info = await client.get_exchange_info()
+
+                for s in exchange_info.get("symbols", []):
+                    if is_futures:
+                        self._futures_symbol_info_cache[s["symbol"]] = s
+                    else:
+                        self._symbol_info_cache[s["symbol"]] = s
+                    if s["symbol"] == symbol:
+                        info = s
+            except Exception:
+                pass
+
+        # Extract MIN_NOTIONAL from filters
+        if info:
+            for f in info.get("filters", []):
+                if f["filterType"] == "MIN_NOTIONAL":
+                    return Decimal(str(f.get("minNotional", f.get("notional", "5"))))
+                # Futures may use NOTIONAL filter instead
+                if f["filterType"] == "NOTIONAL":
+                    return Decimal(str(f.get("notional", "5")))
+
+        # Default minimums based on exchange documentation
+        # USD-M Futures: 5 USDT, Spot: 5 USDT (for most USDT pairs)
+        return Decimal("5")
 
     def round_price(self, symbol: str, price: Decimal) -> Decimal:
         """Round price to valid tick size."""
@@ -542,3 +703,175 @@ class BinanceExecutor(BaseExchange):
 
         # Default precision
         return price.quantize(Decimal("0.01"))
+
+    # ==================== STOP LOSS ORDERS ====================
+
+    async def place_stop_loss_order(
+        self,
+        symbol: str,
+        side: str,  # "BUY" or "SELL" - the position side, not the SL order side
+        quantity: Decimal,
+        stop_price: Decimal,
+        is_futures: bool = True,
+    ) -> dict:
+        """Place a Stop Market order on Binance.
+
+        For a LONG position (side="BUY"), SL order will SELL to close.
+        For a SHORT position (side="SELL"), SL order will BUY to close.
+
+        Args:
+            symbol: Trading symbol (e.g., "BTCUSDT")
+            side: The position side ("BUY" for long, "SELL" for short)
+            quantity: Position quantity to protect
+            stop_price: Price at which to trigger the stop
+            is_futures: Whether this is a futures position
+
+        Returns:
+            Order response dict with orderId
+        """
+        client = self._ensure_client()
+        symbol = self.normalize_symbol(symbol)
+        rounded_stop = self.round_price(symbol, stop_price)
+
+        # SL order side is opposite of position side
+        sl_side = "SELL" if side == "BUY" else "BUY"
+
+        try:
+            if is_futures:
+                # Binance Futures STOP_MARKET order
+                # Uses MARK_PRICE for more stability (prevents manipulation)
+                response = await client.futures_create_order(
+                    symbol=symbol,
+                    side=sl_side,
+                    type="STOP_MARKET",
+                    stopPrice=str(rounded_stop),
+                    quantity=str(self.round_quantity(symbol, quantity, is_futures=True)),
+                    workingType="MARK_PRICE",  # Trigger on mark price, not last price
+                    reduceOnly=True,  # Only reduce position, don't open new one
+                )
+            else:
+                # Spot STOP_LOSS_LIMIT order (spot doesn't have pure stop market)
+                # Use stop price as both trigger and limit for market-like execution
+                response = await client.create_order(
+                    symbol=symbol,
+                    side=sl_side,
+                    type="STOP_LOSS_LIMIT",
+                    stopPrice=str(rounded_stop),
+                    price=str(rounded_stop),  # Limit price = stop price for immediate fill
+                    quantity=str(self.round_quantity(symbol, quantity)),
+                    timeInForce="GTC",
+                )
+
+            logger.info(
+                f"Placed SL order for {symbol}: {sl_side} {quantity} @ stop {rounded_stop}, "
+                f"orderId={response.get('orderId')}"
+            )
+            return response
+
+        except BinanceAPIException as e:
+            logger.error(f"Failed to place stop loss order: {e.message}")
+            raise RuntimeError(f"Stop loss order failed: {e.message}") from e
+
+    async def cancel_stop_loss_order(
+        self,
+        symbol: str,
+        order_id: str,
+        is_futures: bool = True,
+    ) -> bool:
+        """Cancel an existing stop loss order.
+
+        Args:
+            symbol: Trading symbol
+            order_id: The order ID to cancel
+            is_futures: Whether this is a futures order
+
+        Returns:
+            True if cancelled successfully
+        """
+        client = self._ensure_client()
+        symbol = self.normalize_symbol(symbol)
+
+        try:
+            if is_futures:
+                await client.futures_cancel_order(
+                    symbol=symbol,
+                    orderId=int(order_id),
+                )
+            else:
+                await client.cancel_order(
+                    symbol=symbol,
+                    orderId=int(order_id),
+                )
+            logger.info(f"Cancelled SL order {order_id} for {symbol}")
+            return True
+
+        except BinanceAPIException as e:
+            if "Unknown order" in str(e) or "UNKNOWN_ORDER" in str(e):
+                # Order already cancelled or executed
+                return True
+            logger.error(f"Failed to cancel stop loss order: {e.message}")
+            return False
+
+    async def modify_stop_loss_order(
+        self,
+        symbol: str,
+        old_order_id: str,
+        side: str,
+        quantity: Decimal,
+        new_stop_price: Decimal,
+        is_futures: bool = True,
+    ) -> dict | None:
+        """Modify a stop loss by cancelling old and placing new.
+
+        Binance doesn't support order modification, so we cancel and re-place.
+
+        Args:
+            symbol: Trading symbol
+            old_order_id: Current SL order ID to cancel
+            side: Position side ("BUY" or "SELL")
+            quantity: New quantity
+            new_stop_price: New stop price
+            is_futures: Whether this is futures
+
+        Returns:
+            New order response, or None if failed
+        """
+        # Cancel existing order
+        cancelled = await self.cancel_stop_loss_order(symbol, old_order_id, is_futures)
+
+        if not cancelled:
+            logger.warning(f"Could not cancel old SL order {old_order_id}, placing new anyway")
+
+        # Place new order
+        return await self.place_stop_loss_order(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            stop_price=new_stop_price,
+            is_futures=is_futures,
+        )
+
+    def calculate_stop_loss_price(
+        self,
+        entry_price: Decimal,
+        side: str,
+        stop_loss_percent: Decimal,
+    ) -> Decimal:
+        """Calculate stop loss price based on entry and percentage.
+
+        Args:
+            entry_price: Position entry price
+            side: Position side ("BUY" for long, "SELL" for short)
+            stop_loss_percent: Stop loss percentage (e.g., 10 for 10%)
+
+        Returns:
+            Stop loss trigger price
+        """
+        sl_decimal = stop_loss_percent / Decimal("100")
+
+        if side == "BUY":
+            # Long position: SL below entry
+            return entry_price * (Decimal("1") - sl_decimal)
+        else:
+            # Short position: SL above entry
+            return entry_price * (Decimal("1") + sl_decimal)

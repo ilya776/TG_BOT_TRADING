@@ -78,6 +78,12 @@ class WhaleFollowResponse(BaseModel):
     trades_copied: int
     total_profit: Decimal
     followed_at: datetime
+    # Per-whale copy settings
+    stop_loss_percent: Decimal | None = None
+    take_profit_percent: Decimal | None = None
+    leverage: int | None = None
+    margin_mode: str | None = None  # "CROSS" or "ISOLATED"
+    copy_leverage: bool = False
 
     class Config:
         from_attributes = True
@@ -89,6 +95,12 @@ class FollowWhaleRequest(BaseModel):
     trade_size_percent: Decimal | None = Field(None, gt=0, le=100)
     trading_mode_override: str | None = None
     notify_on_trade: bool = True
+    # Per-whale copy settings (E2)
+    stop_loss_percent: Decimal | None = Field(None, ge=1, le=50, description="Stop loss %")
+    take_profit_percent: Decimal | None = Field(None, ge=1, le=200, description="Take profit %")
+    leverage: int | None = Field(None, ge=1, le=125, description="Leverage multiplier")
+    margin_mode: str | None = Field(None, pattern="^(CROSS|ISOLATED)$", description="Margin mode")
+    copy_leverage: bool = Field(False, description="Copy whale's leverage")
 
 
 class UpdateFollowRequest(BaseModel):
@@ -97,6 +109,12 @@ class UpdateFollowRequest(BaseModel):
     trade_size_percent: Decimal | None = Field(None, gt=0, le=100)
     trading_mode_override: str | None = None
     notify_on_trade: bool | None = None
+    # Per-whale copy settings (E2)
+    stop_loss_percent: Decimal | None = Field(None, ge=1, le=50)
+    take_profit_percent: Decimal | None = Field(None, ge=1, le=200)
+    leverage: int | None = Field(None, ge=1, le=125)
+    margin_mode: str | None = Field(None, pattern="^(CROSS|ISOLATED)$")
+    copy_leverage: bool | None = None
 
 
 @router.get("", response_model=list[WhaleWithStatsResponse])
@@ -394,6 +412,12 @@ async def follow_whale(
         trade_size_percent=request.trade_size_percent,
         trading_mode_override=request.trading_mode_override,
         notify_on_trade=request.notify_on_trade,
+        # Per-whale copy settings
+        stop_loss_percent=request.stop_loss_percent,
+        take_profit_percent=request.take_profit_percent,
+        leverage=request.leverage,
+        margin_mode=request.margin_mode,
+        copy_leverage=request.copy_leverage,
     )
 
     db.add(follow)
@@ -412,6 +436,12 @@ async def follow_whale(
         trades_copied=follow.trades_copied,
         total_profit=follow.total_profit,
         followed_at=follow.followed_at,
+        # Per-whale copy settings
+        stop_loss_percent=follow.stop_loss_percent,
+        take_profit_percent=follow.take_profit_percent,
+        leverage=follow.leverage,
+        margin_mode=follow.margin_mode,
+        copy_leverage=follow.copy_leverage,
     )
 
 
@@ -472,6 +502,12 @@ async def update_follow(
         trades_copied=follow.trades_copied,
         total_profit=follow.total_profit,
         followed_at=follow.followed_at,
+        # Per-whale copy settings
+        stop_loss_percent=follow.stop_loss_percent,
+        take_profit_percent=follow.take_profit_percent,
+        leverage=follow.leverage,
+        margin_mode=follow.margin_mode,
+        copy_leverage=follow.copy_leverage,
     )
 
 
@@ -526,6 +562,12 @@ async def get_followed_whales(
             trades_copied=follow.trades_copied,
             total_profit=follow.total_profit,
             followed_at=follow.followed_at,
+            # Per-whale copy settings
+            stop_loss_percent=follow.stop_loss_percent,
+            take_profit_percent=follow.take_profit_percent,
+            leverage=follow.leverage,
+            margin_mode=follow.margin_mode,
+            copy_leverage=follow.copy_leverage,
         )
         for follow, whale_name in follows
     ]

@@ -495,3 +495,238 @@ class OKXExecutor(BaseExchange):
                 return Decimal(str(round(float(price), precision)))
 
         return price.quantize(Decimal("0.01"))
+
+    # ==================== STOP LOSS ORDERS ====================
+
+    async def place_stop_loss_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        stop_price: Decimal,
+        is_futures: bool = True,
+    ) -> dict:
+        """
+        Place a Stop Market order on OKX using algo order.
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            side: Position side ("BUY" for long, "SELL" for short)
+            quantity: Amount to close
+            stop_price: Price at which to trigger the stop
+            is_futures: Whether this is a futures position (default True)
+
+        Returns:
+            dict with order info including algoId
+        """
+        client = self._ensure_client()
+        symbol = self.normalize_symbol(symbol)
+        rounded_stop = self.round_price(symbol, stop_price)
+        rounded_qty = self.round_quantity(symbol, quantity)
+
+        # Stop loss order side is opposite to position side
+        sl_side = "sell" if side.upper() == "BUY" else "buy"
+        pos_side = "long" if side.upper() == "BUY" else "short"
+
+        try:
+            if is_futures:
+                client.options["defaultType"] = "swap"
+
+            # OKX uses algo orders for stop loss
+            # ordType: 'conditional' for stop orders
+            # slTriggerPx: trigger price
+            # slOrdPx: "-1" means market order
+            params = {
+                "tdMode": "cross",
+                "posSide": pos_side,
+                "slTriggerPx": str(rounded_stop),
+                "slOrdPx": "-1",  # -1 = market order
+                "slTriggerPxType": "mark",  # Use mark price for trigger
+                "reduceOnly": True,
+            }
+
+            response = await client.create_order(
+                symbol=symbol,
+                type="conditional",
+                side=sl_side,
+                amount=float(rounded_qty),
+                params=params,
+            )
+
+            if is_futures:
+                client.options["defaultType"] = "spot"
+
+            return {
+                "algoId": response.get("id", response.get("info", {}).get("algoId")),
+                "symbol": symbol,
+                "side": sl_side,
+                "quantity": str(rounded_qty),
+                "stopPrice": str(rounded_stop),
+                "status": "PLACED",
+                "raw": response,
+            }
+
+        except ccxt.BaseError as e:
+            if is_futures:
+                client.options["defaultType"] = "spot"
+            raise RuntimeError(f"OKX stop loss order failed: {str(e)}") from e
+
+    async def cancel_stop_loss_order(
+        self,
+        symbol: str,
+        algo_order_id: str,
+        is_futures: bool = True,
+    ) -> bool:
+        """
+        Cancel an existing stop loss (algo) order.
+
+        Args:
+            symbol: Trading pair
+            algo_order_id: The algo order ID to cancel
+            is_futures: Whether this is a futures position
+
+        Returns:
+            True if cancelled successfully
+        """
+        client = self._ensure_client()
+        symbol = self.normalize_symbol(symbol)
+
+        try:
+            if is_futures:
+                client.options["defaultType"] = "swap"
+
+            # OKX uses cancel_algo_order for algo orders
+            await client.cancel_order(
+                algo_order_id,
+                symbol,
+                params={"stop": True},  # Indicates this is an algo/stop order
+            )
+
+            if is_futures:
+                client.options["defaultType"] = "spot"
+
+            return True
+
+        except ccxt.BaseError as e:
+            if is_futures:
+                client.options["defaultType"] = "spot"
+            # Order may already be filled or cancelled
+            if "does not exist" in str(e).lower() or "not found" in str(e).lower():
+                return True
+            raise RuntimeError(f"OKX cancel stop loss failed: {str(e)}") from e
+
+    async def modify_stop_loss_order(
+        self,
+        symbol: str,
+        algo_order_id: str,
+        new_stop_price: Decimal,
+        quantity: Decimal,
+        side: str,
+        is_futures: bool = True,
+    ) -> dict:
+        """
+        Modify an existing stop loss order.
+        OKX supports amending algo orders directly.
+
+        Args:
+            symbol: Trading pair
+            algo_order_id: The existing algo order ID
+            new_stop_price: New trigger price
+            quantity: Position quantity
+            side: Position side
+            is_futures: Whether futures position
+
+        Returns:
+            dict with new order info
+        """
+        client = self._ensure_client()
+        symbol = self.normalize_symbol(symbol)
+        rounded_stop = self.round_price(symbol, new_stop_price)
+
+        try:
+            if is_futures:
+                client.options["defaultType"] = "swap"
+
+            # Try to amend the algo order
+            response = await client.edit_order(
+                algo_order_id,
+                symbol,
+                type="conditional",
+                side="sell" if side.upper() == "BUY" else "buy",
+                amount=float(quantity),
+                params={
+                    "slTriggerPx": str(rounded_stop),
+                    "stop": True,
+                },
+            )
+
+            if is_futures:
+                client.options["defaultType"] = "spot"
+
+            return {
+                "algoId": response.get("id"),
+                "symbol": symbol,
+                "newStopPrice": str(rounded_stop),
+                "status": "MODIFIED",
+                "raw": response,
+            }
+
+        except ccxt.BaseError:
+            # If amend fails, cancel and recreate
+            if is_futures:
+                client.options["defaultType"] = "spot"
+
+            await self.cancel_stop_loss_order(symbol, algo_order_id, is_futures)
+            return await self.place_stop_loss_order(
+                symbol, side, quantity, new_stop_price, is_futures
+            )
+
+    def calculate_stop_loss_price(
+        self,
+        entry_price: Decimal,
+        side: str,
+        stop_loss_percent: Decimal,
+    ) -> Decimal:
+        """
+        Calculate stop loss price based on entry and percentage.
+
+        Args:
+            entry_price: Position entry price
+            side: "BUY" for long, "SELL" for short
+            stop_loss_percent: Stop loss percentage (e.g., 5 for 5%)
+
+        Returns:
+            Calculated stop loss price
+        """
+        sl_decimal = stop_loss_percent / Decimal("100")
+
+        if side.upper() == "BUY":
+            # Long position - stop below entry
+            return entry_price * (Decimal("1") - sl_decimal)
+        else:
+            # Short position - stop above entry
+            return entry_price * (Decimal("1") + sl_decimal)
+
+    async def get_min_notional(self, symbol: str, is_futures: bool = True) -> Decimal:
+        """
+        Get minimum notional value for a symbol.
+
+        Args:
+            symbol: Trading pair
+            is_futures: Whether futures market
+
+        Returns:
+            Minimum notional in quote currency (USDT)
+        """
+        symbol = self.normalize_symbol(symbol)
+        market = self._markets_cache.get(symbol)
+
+        if market:
+            limits = market.get("limits", {})
+            cost_min = limits.get("cost", {}).get("min")
+            if cost_min:
+                return Decimal(str(cost_min))
+
+        # OKX default minimums (from API docs)
+        # Most perpetual swaps have ~$5 minimum
+        return Decimal("5.0") if is_futures else Decimal("1.0")

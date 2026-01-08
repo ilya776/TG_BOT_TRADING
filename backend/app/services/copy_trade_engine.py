@@ -30,6 +30,7 @@ from app.models.user import User, UserAPIKey, UserSettings
 from app.models.whale import UserWhaleFollow
 from app.services.exchanges import get_exchange_executor, CircuitOpenError
 from app.services.risk_manager import RiskManager
+from app.services.wallet_manager import WalletManager
 from app.utils.encryption import get_encryption_manager
 
 logger = logging.getLogger(__name__)
@@ -229,7 +230,9 @@ class CopyTradeEngine:
 
         # Determine trading mode
         is_futures = self._should_use_futures(follow, settings, user)
-        leverage = settings.default_leverage if settings and is_futures else 1
+
+        # Get leverage (priority: follow-specific > user settings > default)
+        leverage = self._get_leverage(follow, settings, signal, is_futures)
 
         # Risk check
         risk_manager = RiskManager(self.db)
@@ -307,6 +310,8 @@ class CopyTradeEngine:
 
         trade = None
         order_result = None
+        balance_reserved = False  # Track if balance was reserved for proper cleanup
+        trade_successful = False  # Track if trade completed successfully
 
         try:
             # ============================================
@@ -341,7 +346,30 @@ class CopyTradeEngine:
             if not current_price:
                 return CopyTradeResult(success=False, error="Could not get current price")
 
-            quantity = trade_size_usdt / current_price
+            # Validate against exchange minimum notional value
+            min_notional = await executor.get_min_notional(signal.cex_symbol, is_futures=is_futures)
+            if is_futures:
+                # For futures, position value must exceed min notional
+                position_value_check = trade_size_usdt * Decimal(leverage)
+            else:
+                # For spot, trade size must exceed min notional
+                position_value_check = trade_size_usdt
+
+            if position_value_check < min_notional:
+                return CopyTradeResult(
+                    success=False,
+                    error=f"Trade size ${trade_size_usdt} (notional ${position_value_check}) "
+                          f"below exchange minimum ${min_notional}. "
+                          f"Increase trade size or use higher leverage.",
+                )
+
+            # For futures, apply leverage to calculate position size
+            # Margin * leverage = position value, then divide by price for quantity
+            if is_futures:
+                position_value = trade_size_usdt * Decimal(leverage)
+                quantity = position_value / current_price
+            else:
+                quantity = trade_size_usdt / current_price
 
             # Create PENDING trade record (reservation)
             trade = Trade(
@@ -366,6 +394,7 @@ class CopyTradeEngine:
 
             # Reserve balance (deduct from available)
             locked_user.available_balance -= trade_size_usdt
+            balance_reserved = True  # Mark that balance was reserved
 
             # COMMIT PHASE 1 - reservation is now durable
             await self.db.commit()
@@ -384,6 +413,51 @@ class CopyTradeEngine:
                 trade.status = TradeStatus.EXECUTING
                 await self.db.commit()
 
+                # For futures, auto-transfer from spot if needed using WalletManager
+                if is_futures:
+                    try:
+                        # Determine futures type from signal or default to USD-M
+                        futures_type = getattr(signal, 'futures_type', None) or "USD-M"
+                        currency = "USDT" if futures_type == "USD-M" else "BTC"
+
+                        wallet_manager = WalletManager(executor)
+                        balance_ok, balance_msg = await wallet_manager.ensure_futures_balance(
+                            required_amount=trade_size_usdt,
+                            currency=currency,
+                            futures_type=futures_type,
+                            buffer_percent=Decimal("10"),
+                        )
+
+                        if balance_ok:
+                            logger.info(f"Futures balance check for user {user.id}: {balance_msg}")
+                        else:
+                            logger.warning(
+                                f"Futures balance issue for user {user.id}: {balance_msg}. "
+                                f"Continuing anyway (may fail on exchange)."
+                            )
+                    except Exception as transfer_error:
+                        logger.warning(f"Auto-transfer failed (continuing): {transfer_error}")
+
+                # For futures, set leverage on exchange to match our settings
+                if is_futures:
+                    try:
+                        await executor.set_leverage(signal.cex_symbol, leverage)
+                        logger.info(f"Set leverage to {leverage}x for {signal.cex_symbol}")
+                    except Exception as lev_error:
+                        logger.warning(f"Could not set leverage (using account default): {lev_error}")
+                        # Read actual leverage from exchange for correct calculations
+                        try:
+                            actual_leverage = await executor.get_leverage(signal.cex_symbol)
+                            if actual_leverage != leverage:
+                                logger.info(f"Using actual leverage {actual_leverage}x instead of {leverage}x")
+                                leverage = actual_leverage
+                                # Recalculate quantity with actual leverage
+                                position_value = trade_size_usdt * Decimal(leverage)
+                                quantity = position_value / current_price
+                                quantity = executor.round_quantity(signal.cex_symbol, quantity, is_futures=True)
+                        except Exception:
+                            pass
+
                 if signal.action.value == "BUY":
                     if is_futures:
                         order_result = await executor.futures_market_long(
@@ -391,9 +465,14 @@ class CopyTradeEngine:
                             quantity=quantity,
                         )
                     else:
+                        # Use quote_order_qty for spot buys to specify exact USDT amount
+                        # This works better for small balances and avoids NOTIONAL filter errors
+                        # Round to 2 decimal places to avoid precision errors
+                        rounded_quote_qty = trade_size_usdt.quantize(Decimal("0.01"))
                         order_result = await executor.spot_market_buy(
                             symbol=signal.cex_symbol,
                             quantity=quantity,
+                            quote_order_qty=rounded_quote_qty,
                         )
                 else:  # SELL
                     if is_futures:
@@ -424,6 +503,7 @@ class CopyTradeEngine:
                 )
                 user_to_restore = locked_user_result.scalar_one()
                 user_to_restore.available_balance += trade_size_usdt
+                balance_reserved = False  # Balance restored, don't restore again in finally
                 await self.db.commit()
 
                 return CopyTradeResult(
@@ -454,6 +534,54 @@ class CopyTradeEngine:
                 leverage=leverage,
             )
 
+            # ============================================
+            # AUTO STOP LOSS: Place SL order on exchange
+            # ============================================
+            stop_loss_percent = self._get_stop_loss_percent(follow, settings)
+            if stop_loss_percent and is_futures and hasattr(executor, 'place_stop_loss_order'):
+                try:
+                    # Calculate SL price based on entry
+                    sl_price = executor.calculate_stop_loss_price(
+                        entry_price=position.entry_price,
+                        side=signal.action.value,
+                        stop_loss_percent=stop_loss_percent,
+                    )
+
+                    # Round to exchange precision
+                    sl_price = executor.round_price(signal.cex_symbol, sl_price)
+
+                    # Place SL order on exchange
+                    sl_result = await executor.place_stop_loss_order(
+                        symbol=signal.cex_symbol,
+                        side=signal.action.value,
+                        quantity=position.remaining_quantity,
+                        stop_price=sl_price,
+                        is_futures=True,
+                    )
+
+                    # Update position with SL details
+                    position.stop_loss_price = sl_price
+                    position.stop_loss_order_id = sl_result.get("orderId") or sl_result.get("algoId")
+
+                    logger.info(
+                        f"Auto SL placed for position {position.id}: "
+                        f"{stop_loss_percent}% at ${sl_price} (order: {position.stop_loss_order_id})"
+                    )
+
+                except Exception as sl_error:
+                    # SL placement failed - log but don't fail the trade
+                    logger.warning(
+                        f"Failed to place auto SL for position {position.id}: {sl_error}. "
+                        f"Position opened without exchange stop loss."
+                    )
+                    # Still set the SL price in DB for reference
+                    if hasattr(executor, 'calculate_stop_loss_price'):
+                        position.stop_loss_price = executor.calculate_stop_loss_price(
+                            entry_price=position.entry_price,
+                            side=signal.action.value,
+                            stop_loss_percent=stop_loss_percent,
+                        )
+
             # Update follow statistics
             follow.trades_copied += 1
 
@@ -467,6 +595,9 @@ class CopyTradeEngine:
                 f"{signal.action.value} {order_result.filled_quantity} {signal.cex_symbol} "
                 f"at {order_result.avg_fill_price}"
             )
+
+            trade_successful = True  # Mark trade as successful - balance should stay deducted
+            balance_reserved = False  # Clear flag so finally doesn't restore balance
 
             return CopyTradeResult(
                 success=True,
@@ -511,6 +642,27 @@ class CopyTradeEngine:
             )
 
         finally:
+            # CRITICAL: Restore balance if it was reserved but trade didn't complete successfully
+            if balance_reserved:
+                try:
+                    async with get_db_context() as restore_db:
+                        restore_result = await restore_db.execute(
+                            select(User).where(User.id == user.id).with_for_update()
+                        )
+                        user_to_restore = restore_result.scalar_one_or_none()
+                        if user_to_restore:
+                            user_to_restore.available_balance += trade_size_usdt
+                            await restore_db.commit()
+                            logger.warning(
+                                f"Balance restored for user {user.id}: +{trade_size_usdt} USDT "
+                                f"(trade {'success' if trade_successful else 'failed'})"
+                            )
+                except Exception as restore_error:
+                    logger.critical(
+                        f"CRITICAL: Failed to restore balance for user {user.id}: {restore_error}. "
+                        f"Manual intervention required: restore {trade_size_usdt} USDT"
+                    )
+
             await executor.close()
 
     async def _calculate_trade_size(
@@ -560,6 +712,65 @@ class CopyTradeEngine:
             return settings.trading_mode.value in ("FUTURES", "MIXED")
 
         return False
+
+    def _get_stop_loss_percent(
+        self,
+        follow: UserWhaleFollow,
+        settings: UserSettings | None,
+    ) -> Decimal | None:
+        """
+        Get stop loss percentage for the trade.
+
+        Priority:
+        1. Follow-specific stop_loss_percent (per-whale setting)
+        2. User's default stop_loss_percent (from settings)
+        3. None (no auto SL)
+        """
+        # Check follow-specific override first
+        if hasattr(follow, 'stop_loss_percent') and follow.stop_loss_percent:
+            return follow.stop_loss_percent
+
+        # Check user settings
+        if settings and hasattr(settings, 'stop_loss_percent') and settings.stop_loss_percent:
+            return settings.stop_loss_percent
+
+        return None
+
+    def _get_leverage(
+        self,
+        follow: UserWhaleFollow,
+        settings: UserSettings | None,
+        signal: WhaleSignal,
+        is_futures: bool,
+    ) -> int:
+        """
+        Get leverage for the trade.
+
+        Priority:
+        1. Copy whale's leverage (if copy_leverage=True and signal has leverage)
+        2. Follow-specific leverage (per-whale setting)
+        3. User's default_leverage (from settings)
+        4. Default: 1 (no leverage)
+        """
+        if not is_futures:
+            return 1
+
+        # Check if we should copy whale's leverage
+        if hasattr(follow, 'copy_leverage') and follow.copy_leverage:
+            if hasattr(signal, 'leverage') and signal.leverage:
+                logger.info(f"Copying whale leverage: {signal.leverage}x")
+                return int(signal.leverage)
+
+        # Check follow-specific leverage
+        if hasattr(follow, 'leverage') and follow.leverage:
+            return follow.leverage
+
+        # Check user default settings
+        if settings and settings.default_leverage:
+            return settings.default_leverage
+
+        # Default leverage
+        return 5
 
     async def _get_user_api_key(
         self,

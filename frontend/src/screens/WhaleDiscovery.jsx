@@ -379,14 +379,21 @@ function WhaleDiscoveryCard({ whale, index, onClick, onFollow, onUnfollow, toast
   )
 }
 
-function WhaleDetailModal({ whale, onClose, onFollow, onUnfollow, onUpdateFollow }) {
+function WhaleDetailModal({ whale, onClose, onFollow, onUnfollow, onUpdateFollow, toast }) {
   const [isFollowing, setIsFollowing] = useState(whale.isFollowing)
   const [copySettings, setCopySettings] = useState({
     tradeSize: 100,
     autoCopy: false,
-    maxLoss: 10,
+    tradingMode: 'FUTURES',
+    // New per-whale copy settings (E3)
+    stopLoss: 10,
+    takeProfit: 0,  // 0 = disabled
+    leverage: 5,
+    marginMode: 'CROSS',
+    copyLeverage: false,
   })
   const [isLoading, setIsLoading] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
 
   const chartData = whale.chart_data?.map((value) => ({ value })) ||
     [40, 45, 42, 55, 60, 58, 65, 70, 68, 75, 80, 85].map(v => ({ value: v }))
@@ -435,10 +442,19 @@ function WhaleDetailModal({ whale, onClose, onFollow, onUnfollow, onUpdateFollow
         await onUpdateFollow({
           auto_copy_enabled: newSettings.autoCopy,
           trade_size_usdt: newSettings.tradeSize,
+          trading_mode_override: newSettings.tradingMode,
+          // Per-whale copy settings
+          stop_loss_percent: newSettings.stopLoss > 0 ? newSettings.stopLoss : null,
+          take_profit_percent: newSettings.takeProfit > 0 ? newSettings.takeProfit : null,
+          leverage: newSettings.leverage,
+          margin_mode: newSettings.marginMode,
+          copy_leverage: newSettings.copyLeverage,
         })
+        if (toast) toast.success('Settings saved')
       } catch (err) {
         // Rollback on error
         setCopySettings(previousSettings)
+        if (toast) toast.error('Failed to save settings')
         console.error('Update settings error:', err)
       }
     }
@@ -582,6 +598,7 @@ function WhaleDetailModal({ whale, onClose, onFollow, onUnfollow, onUpdateFollow
               <p className="text-sm text-gray-400 mb-4">Copy Settings</p>
 
               <div className="space-y-4">
+                {/* Trade Size */}
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <label className="text-sm text-white">Trade Size</label>
@@ -598,6 +615,24 @@ function WhaleDetailModal({ whale, onClose, onFollow, onUnfollow, onUpdateFollow
                   />
                 </div>
 
+                {/* Stop Loss */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="text-sm text-white">Stop Loss</label>
+                    <span className="font-mono text-loss">{copySettings.stopLoss}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="5"
+                    max="50"
+                    step="1"
+                    value={copySettings.stopLoss}
+                    onChange={(e) => handleSettingsChange('stopLoss', Number(e.target.value))}
+                    className="w-full accent-loss"
+                  />
+                </div>
+
+                {/* Auto-Copy Toggle */}
                 <div className="flex items-center justify-between">
                   <label className="text-sm text-white">Auto-Copy</label>
                   <button
@@ -613,6 +648,138 @@ function WhaleDetailModal({ whale, onClose, onFollow, onUnfollow, onUpdateFollow
                     />
                   </button>
                 </div>
+
+                {/* Advanced Settings Toggle */}
+                <button
+                  onClick={() => setShowAdvanced(!showAdvanced)}
+                  className="text-sm text-biolum-cyan flex items-center gap-1"
+                >
+                  <ChevronDown className={`w-4 h-4 transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
+                  {showAdvanced ? 'Hide' : 'Show'} Advanced
+                </button>
+
+                {/* Advanced Settings */}
+                <AnimatePresence>
+                  {showAdvanced && (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: 'auto' }}
+                      exit={{ opacity: 0, height: 0 }}
+                      className="space-y-4 pt-2 border-t border-ocean-600"
+                    >
+                      {/* Take Profit (optional) */}
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="text-sm text-white">Take Profit (optional)</label>
+                          <span className="font-mono text-profit">
+                            {copySettings.takeProfit > 0 ? `${copySettings.takeProfit}%` : 'Off'}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          step="5"
+                          value={copySettings.takeProfit}
+                          onChange={(e) => handleSettingsChange('takeProfit', Number(e.target.value))}
+                          className="w-full accent-profit"
+                        />
+                      </div>
+
+                      {/* Leverage */}
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="text-sm text-white">Leverage</label>
+                          <span className="font-mono text-biolum-purple">{copySettings.leverage}x</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="1"
+                          max="20"
+                          step="1"
+                          value={copySettings.leverage}
+                          onChange={(e) => handleSettingsChange('leverage', Number(e.target.value))}
+                          className="w-full accent-biolum-purple"
+                          disabled={copySettings.copyLeverage}
+                        />
+                      </div>
+
+                      {/* Copy Whale's Leverage */}
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <label className="text-sm text-white">Copy Whale's Leverage</label>
+                          <p className="text-xs text-gray-500">Use same leverage as whale</p>
+                        </div>
+                        <button
+                          onClick={() => handleSettingsChange('copyLeverage', !copySettings.copyLeverage)}
+                          className={`w-12 h-6 rounded-full transition-colors ${
+                            copySettings.copyLeverage ? 'bg-biolum-purple' : 'bg-ocean-600'
+                          }`}
+                        >
+                          <div
+                            className={`w-5 h-5 rounded-full bg-white transition-transform ${
+                              copySettings.copyLeverage ? 'translate-x-6' : 'translate-x-0.5'
+                            }`}
+                          />
+                        </button>
+                      </div>
+
+                      {/* Margin Mode */}
+                      <div>
+                        <label className="text-sm text-white mb-2 block">Margin Mode</label>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => handleSettingsChange('marginMode', 'CROSS')}
+                            className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${
+                              copySettings.marginMode === 'CROSS'
+                                ? 'bg-biolum-cyan/20 text-biolum-cyan border border-biolum-cyan/30'
+                                : 'bg-ocean-700/50 text-gray-400'
+                            }`}
+                          >
+                            Cross
+                          </button>
+                          <button
+                            onClick={() => handleSettingsChange('marginMode', 'ISOLATED')}
+                            className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${
+                              copySettings.marginMode === 'ISOLATED'
+                                ? 'bg-biolum-cyan/20 text-biolum-cyan border border-biolum-cyan/30'
+                                : 'bg-ocean-700/50 text-gray-400'
+                            }`}
+                          >
+                            Isolated
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Trading Mode */}
+                      <div>
+                        <label className="text-sm text-white mb-2 block">Trading Mode</label>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => handleSettingsChange('tradingMode', 'SPOT')}
+                            className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${
+                              copySettings.tradingMode === 'SPOT'
+                                ? 'bg-profit/20 text-profit border border-profit/30'
+                                : 'bg-ocean-700/50 text-gray-400'
+                            }`}
+                          >
+                            Spot
+                          </button>
+                          <button
+                            onClick={() => handleSettingsChange('tradingMode', 'FUTURES')}
+                            className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${
+                              copySettings.tradingMode === 'FUTURES'
+                                ? 'bg-biolum-purple/20 text-biolum-purple border border-biolum-purple/30'
+                                : 'bg-ocean-700/50 text-gray-400'
+                            }`}
+                          >
+                            Futures
+                          </button>
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
             </motion.div>
           )}

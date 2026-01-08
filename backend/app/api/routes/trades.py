@@ -107,6 +107,16 @@ class PortfolioSummary(BaseModel):
     realized_pnl_week: Decimal
     realized_pnl_month: Decimal
     open_positions_count: int
+    # F3: Win rate and trade statistics
+    total_closed_positions: int = 0
+    winning_positions: int = 0
+    losing_positions: int = 0
+    win_rate: Decimal = Decimal("0")
+    average_win: Decimal = Decimal("0")
+    average_loss: Decimal = Decimal("0")
+    profit_factor: Decimal = Decimal("0")  # gross_profit / gross_loss
+    largest_win: Decimal = Decimal("0")
+    largest_loss: Decimal = Decimal("0")
 
 
 @router.get("/trades", response_model=list[TradeResponse])
@@ -312,8 +322,12 @@ async def close_position(
         await executor.initialize()
 
         # Execute close order based on position type
-        is_spot = position.position_type == TradeType.SPOT or not position.leverage or position.leverage <= 1
+        # Use position_type as primary indicator - leverage doesn't determine spot/futures
+        # (futures can have 1x leverage in cross margin mode)
+        is_spot = position.position_type == TradeType.SPOT
         quantity = Decimal(str(position.quantity)) if position.quantity else None
+
+        logger.info(f"Close position {position_id}: type={position.position_type}, leverage={position.leverage}, is_spot={is_spot}")
 
         if is_spot:
             # For spot: get actual balance from exchange and sell that
@@ -369,20 +383,44 @@ async def close_position(
         logger.info(f"Position {position_id} closed at {now}, exit_price={position.exit_price}")
 
         # Calculate realized PnL based on actual exit price (wrapped in try to not lose close status)
+        # F1: Include fees in PnL calculation
+        # F2: Include leverage in PnL percent (for futures, ROI on margin = price_change_% * leverage)
         try:
             if position.exit_price and position.entry_price:
                 entry = Decimal(str(position.entry_price))
                 exit_price = Decimal(str(position.exit_price))
                 size = Decimal(str(position.entry_value_usdt or 0))
+                leverage = position.leverage or 1
+                fees = Decimal(str(position.total_fees or 0))
 
                 if entry > 0 and size > 0:
+                    # Calculate price change percentage
                     if position.side == "BUY":
-                        pnl_percent = ((exit_price - entry) / entry) * 100
+                        price_change_pct = ((exit_price - entry) / entry) * 100
                     else:
-                        pnl_percent = ((entry - exit_price) / entry) * 100
+                        price_change_pct = ((entry - exit_price) / entry) * 100
 
-                    position.realized_pnl = (pnl_percent / 100) * size
+                    # For futures with leverage, actual ROI on margin = price_change * leverage
+                    # For spot (leverage=1), this is unchanged
+                    pnl_percent = price_change_pct * Decimal(leverage)
+
+                    # Calculate gross PnL
+                    gross_pnl = (price_change_pct / 100) * size * Decimal(leverage)
+
+                    # Subtract fees for net PnL
+                    position.realized_pnl = gross_pnl - fees
                     position.realized_pnl_percent = pnl_percent
+
+                    # Adjust percent for fees if significant
+                    if size > 0 and fees > 0:
+                        fee_impact_pct = (fees / size) * 100 * Decimal(leverage)
+                        position.realized_pnl_percent = pnl_percent - fee_impact_pct
+
+                    logger.info(
+                        f"PnL calculation: entry={entry}, exit={exit_price}, leverage={leverage}x, "
+                        f"price_change={price_change_pct:.2f}%, gross_pnl={gross_pnl:.2f}, "
+                        f"fees={fees:.2f}, net_pnl={position.realized_pnl:.2f} ({position.realized_pnl_percent:.2f}%)"
+                    )
                 else:
                     position.realized_pnl = position.unrealized_pnl or Decimal("0")
                     position.realized_pnl_percent = position.unrealized_pnl_percent or Decimal("0")
@@ -419,7 +457,7 @@ async def get_portfolio_summary(
     current_user: CurrentUser,
     db: DbSession,
 ) -> PortfolioSummary:
-    """Get portfolio summary."""
+    """Get portfolio summary with win rate and trade statistics."""
     from datetime import timedelta
 
     # Get open positions stats
@@ -471,6 +509,47 @@ async def get_portfolio_summary(
     realized_pnl_week = await get_realized_pnl_since(week_start)
     realized_pnl_month = await get_realized_pnl_since(month_start)
 
+    # F3: Calculate win rate and trade statistics
+    # Get all closed positions for statistics
+    closed_positions_result = await db.execute(
+        select(Position.realized_pnl).where(
+            Position.user_id == current_user.id,
+            Position.status == PositionStatus.CLOSED,
+        )
+    )
+    closed_positions = [row[0] or Decimal("0") for row in closed_positions_result.all()]
+
+    total_closed = len(closed_positions)
+    winning_trades = [p for p in closed_positions if p > 0]
+    losing_trades = [p for p in closed_positions if p < 0]
+
+    winning_count = len(winning_trades)
+    losing_count = len(losing_trades)
+
+    # Calculate win rate
+    win_rate = Decimal("0")
+    if total_closed > 0:
+        win_rate = (Decimal(winning_count) / Decimal(total_closed)) * 100
+
+    # Calculate average win/loss
+    average_win = Decimal("0")
+    average_loss = Decimal("0")
+    if winning_trades:
+        average_win = sum(winning_trades) / len(winning_trades)
+    if losing_trades:
+        average_loss = abs(sum(losing_trades)) / len(losing_trades)
+
+    # Calculate profit factor (gross profit / gross loss)
+    gross_profit = sum(winning_trades) if winning_trades else Decimal("0")
+    gross_loss = abs(sum(losing_trades)) if losing_trades else Decimal("0")
+    profit_factor = Decimal("0")
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+
+    # Largest win/loss
+    largest_win = max(winning_trades) if winning_trades else Decimal("0")
+    largest_loss = abs(min(losing_trades)) if losing_trades else Decimal("0")
+
     total_value = current_user.available_balance + positions_value
 
     return PortfolioSummary(
@@ -483,6 +562,16 @@ async def get_portfolio_summary(
         realized_pnl_week=realized_pnl_week,
         realized_pnl_month=realized_pnl_month,
         open_positions_count=positions_count,
+        # F3: Trade statistics
+        total_closed_positions=total_closed,
+        winning_positions=winning_count,
+        losing_positions=losing_count,
+        win_rate=win_rate.quantize(Decimal("0.01")),
+        average_win=average_win.quantize(Decimal("0.01")),
+        average_loss=average_loss.quantize(Decimal("0.01")),
+        profit_factor=profit_factor.quantize(Decimal("0.01")),
+        largest_win=largest_win.quantize(Decimal("0.01")),
+        largest_loss=largest_loss.quantize(Decimal("0.01")),
     )
 
 

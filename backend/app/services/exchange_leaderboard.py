@@ -66,10 +66,10 @@ class ExchangeLeaderboardService:
         all_traders = []
 
         # Fetch from each exchange in parallel
+        # Note: Bitget V2 API requires authentication, so we only use Binance and OKX
         results = await asyncio.gather(
             self.fetch_binance_leaderboard(limit=limit),
-            self.fetch_bitget_copy_traders(limit=limit),
-            self.fetch_bybit_copy_traders(limit=limit),
+            self.fetch_okx_copy_traders(limit=limit),
             return_exceptions=True
         )
 
@@ -163,58 +163,63 @@ class ExchangeLeaderboardService:
 
         return None
 
-    async def fetch_bybit_copy_traders(self, limit: int = 50) -> list[TopTrader]:
+    async def fetch_okx_copy_traders(self, limit: int = 50) -> list[TopTrader]:
         """
-        Fetch Bybit copy trading master traders.
-        Uses the newer V5 API.
+        Fetch OKX copy trading master traders.
+        Uses the public copy trading API.
         """
         traders = []
 
         try:
-            # Bybit Copy Trading V5 API
-            url = "https://api.bybit.com/v5/copy-trading/public/leaders"
+            # OKX Copy Trading public API - working endpoint
+            url = "https://www.okx.com/api/v5/copytrading/public-lead-traders"
 
-            params = {
-                "limit": min(limit, 50),
-                "sortBy": "roi7D",
-                "sortType": "desc"
-            }
-
-            response = await self.client.get(url, params=params)
+            response = await self.client.get(url)
 
             if response.status_code != 200:
-                logger.warning(f"Bybit copy trading API returned {response.status_code}")
+                logger.warning(f"OKX copy trading API returned {response.status_code}")
                 return traders
 
             data = response.json()
-            result = data.get("result", {})
-            leader_list = result.get("list", []) if isinstance(result, dict) else []
+            # OKX structure: data[0].ranks[] contains the traders
+            raw_data = data.get("data", [])
+            if raw_data and isinstance(raw_data, list) and len(raw_data) > 0:
+                trader_list = raw_data[0].get("ranks", [])
+            else:
+                trader_list = []
 
-            for i, item in enumerate(leader_list[:limit]):
+            for i, item in enumerate(trader_list[:limit]):
                 try:
+                    # OKX returns ROI as decimal string (1.3259 = 132.59%)
+                    roi_raw = Decimal(str(item.get("pnlRatio", 0)))
+                    roi_7d = roi_raw * 100  # Convert to percentage
+
+                    win_rate_raw = item.get("winRatio", 0)
+                    win_rate = Decimal(str(win_rate_raw)) * 100  # Convert to percentage
+
                     trader = TopTrader(
-                        uid=str(item.get("leaderMark", item.get("leaderId", ""))),
-                        nickname=item.get("nickName", f"Bybit Master #{i+1}"),
-                        exchange="BYBIT",
-                        roi_7d=Decimal(str(item.get("roi7D", item.get("roi7d", 0)))),
-                        roi_30d=Decimal(str(item.get("roi30D", item.get("roi30d", 0)))),
-                        roi_90d=Decimal(str(item.get("roi90D", 0))),
-                        pnl_7d=Decimal(str(item.get("pnl7D", item.get("pnl7d", 0)))),
-                        pnl_30d=Decimal(str(item.get("pnl30D", 0))),
-                        pnl_total=Decimal(str(item.get("totalPnl", 0))),
-                        win_rate=Decimal(str(item.get("winRate", 0))) * 100 if float(item.get("winRate", 0)) <= 1 else Decimal(str(item.get("winRate", 0))),
-                        total_trades=int(item.get("totalTrades", 0)),
-                        followers_count=int(item.get("followerNum", item.get("currentFollowerNum", 0))),
+                        uid=str(item.get("uniqueCode", "")),
+                        nickname=item.get("nickName", f"OKX Master #{i+1}"),
+                        exchange="OKX",
+                        roi_7d=roi_7d,
+                        roi_30d=roi_7d,  # Use same as 7d
+                        roi_90d=roi_7d,  # Use same
+                        pnl_7d=Decimal(str(item.get("pnl", 0))),
+                        pnl_30d=Decimal(str(item.get("pnl", 0))),
+                        pnl_total=Decimal(str(item.get("pnl", 0))),
+                        win_rate=win_rate,
+                        total_trades=int(item.get("leadDays", 0)) * 5,  # Estimate from days
+                        followers_count=int(item.get("copyTraderNum", item.get("accCopyTraderNum", 0))),
                         rank=i + 1
                     )
                     traders.append(trader)
                 except Exception as e:
-                    logger.warning(f"Error parsing Bybit trader: {e}")
+                    logger.warning(f"Error parsing OKX trader: {e}")
 
-            logger.info(f"Fetched {len(traders)} traders from Bybit copy trading")
+            logger.info(f"Fetched {len(traders)} traders from OKX copy trading")
 
         except Exception as e:
-            logger.error(f"Error fetching Bybit copy traders: {e}")
+            logger.error(f"Error fetching OKX copy traders: {e}")
 
         return traders
 
@@ -226,13 +231,14 @@ class ExchangeLeaderboardService:
         traders = []
 
         try:
-            # Bitget Copy Trading public API
-            url = "https://api.bitget.com/api/mix/v1/copytrade/public/trader/ranking"
+            # Bitget Copy Trading public API - traderList endpoint
+            url = "https://api.bitget.com/api/mix/v1/trace/traderList"
 
             params = {
-                "pageNo": "1",
-                "pageSize": str(min(limit, 50)),
-                "sort": "WEEK_ROI"  # Sort by 7-day ROI
+                "sortRule": "roi",  # Sort by ROI (options: composite, roi, totalPL, aum)
+                "sortFlag": "desc",  # Descending order
+                "fullStatus": "all",  # All traders
+                "languageType": "en-US"
             }
 
             response = await self.client.get(url, params=params)
@@ -242,28 +248,45 @@ class ExchangeLeaderboardService:
                 return traders
 
             data = response.json()
-            trader_list = data.get("data", {}).get("list", [])
+            # Handle both list directly or nested under "list"
+            raw_list = data.get("data", [])
+            trader_list = raw_list.get("list", raw_list) if isinstance(raw_list, dict) else raw_list
 
             for i, item in enumerate(trader_list[:limit]):
                 try:
-                    # Bitget returns ROI as decimal (0.15 = 15%)
-                    roi_7d = Decimal(str(item.get("weekRoi", item.get("roiWeek", 0)))) * 100
-                    roi_30d = Decimal(str(item.get("monthRoi", item.get("roiMonth", 0)))) * 100
-                    win_rate = Decimal(str(item.get("winRate", 0))) * 100 if float(item.get("winRate", 0)) <= 1 else Decimal(str(item.get("winRate", 0)))
+                    # Bitget returns ROI - handle various field names from different endpoints
+                    # traderList uses: roi, weekRoi, monthRoi
+                    roi_7d_raw = item.get("roi", item.get("weekRoi", item.get("roiWeek", 0)))
+                    roi_30d_raw = item.get("monthRoi", item.get("roiMonth", roi_7d_raw))
+
+                    # Convert ROI - Bitget API returns ROI as percentage (15.5 = 15.5%)
+                    # Only convert if clearly in decimal format (< 1.0 means fraction like 0.15)
+                    roi_7d = Decimal(str(roi_7d_raw))
+                    if abs(roi_7d) < Decimal("1.0") and roi_7d != 0:
+                        # Definitely decimal format (0.15 = 15%)
+                        roi_7d = roi_7d * 100
+                        logger.debug(f"Bitget ROI converted from decimal: {roi_7d_raw} -> {roi_7d}%")
+
+                    roi_30d = Decimal(str(roi_30d_raw))
+                    if abs(roi_30d) < Decimal("1.0") and roi_30d != 0:
+                        roi_30d = roi_30d * 100
+
+                    win_rate_raw = item.get("winRate", item.get("winRatio", 0))
+                    win_rate = Decimal(str(win_rate_raw)) * 100 if float(win_rate_raw) <= 1 else Decimal(str(win_rate_raw))
 
                     trader = TopTrader(
-                        uid=str(item.get("traderUid", item.get("traderId", ""))),
-                        nickname=item.get("traderName", item.get("nickName", f"Bitget Master #{i+1}")),
+                        uid=str(item.get("uid", item.get("traderUid", item.get("traderId", "")))),
+                        nickname=item.get("nickName", item.get("traderName", f"Bitget Master #{i+1}")),
                         exchange="BITGET",
                         roi_7d=roi_7d,
                         roi_30d=roi_30d,
-                        roi_90d=Decimal(str(item.get("totalRoi", 0))) * 100,
-                        pnl_7d=Decimal(str(item.get("weekPnl", item.get("pnlWeek", 0)))),
+                        roi_90d=Decimal(str(item.get("totalRoi", 0))) * 100 if abs(float(item.get("totalRoi", 0))) < 1.0 else Decimal(str(item.get("totalRoi", 0))),
+                        pnl_7d=Decimal(str(item.get("weekPnl", item.get("pnlWeek", item.get("totalPL", 0))))),
                         pnl_30d=Decimal(str(item.get("monthPnl", 0))),
-                        pnl_total=Decimal(str(item.get("totalPnl", 0))),
+                        pnl_total=Decimal(str(item.get("totalPnl", item.get("totalPL", 0)))),
                         win_rate=win_rate,
-                        total_trades=int(item.get("totalTrade", item.get("tradeCount", 0))),
-                        followers_count=int(item.get("followerCount", item.get("copyCount", 0))),
+                        total_trades=int(item.get("totalTrade", item.get("tradeCount", item.get("orderNum", 0)))),
+                        followers_count=int(item.get("followerCount", item.get("copyCount", item.get("copyTradeNum", 0)))),
                         rank=i + 1
                     )
                     traders.append(trader)

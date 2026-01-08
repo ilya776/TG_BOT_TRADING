@@ -162,3 +162,26 @@ SUPPORTED_DEXES = {
 
 # Supported CEXes
 SUPPORTED_CEXES = ["binance", "okx", "bybit"]
+
+# Trading Minimums (G1-G2: Smart position sizing)
+MIN_TRADING_BALANCE_USDT = 5.0  # Minimum user balance to allow trading
+MIN_TRADE_SIZE_USDT = 5.0  # Minimum trade size (absolute floor)
+TRADE_SIZE_BUFFER_PERCENT = 20  # Buffer % above exchange minimum
+
+# Exchange-specific minimum notional values (USD)
+EXCHANGE_MIN_NOTIONAL = {
+    "binance": {
+        "USD-M": 5.0,     # 5 USDT min for USD-M futures
+        "COIN-M": 10.0,   # ~0.0001 BTC (~$10) for COIN-M
+        "SPOT": 10.0,     # 10 USDT min for spot
+    },
+    "okx": {
+        "USD-M": 5.0,
+        "COIN-M": 10.0,
+        "SPOT": 5.0,
+    },
+    "bitget": {
+        "USD-M": 5.0,
+        "SPOT": 5.0,
+    },
+}

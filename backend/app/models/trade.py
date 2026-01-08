@@ -206,7 +206,9 @@ class Position(Base):
 
     # Risk management
     stop_loss_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 18))
+    stop_loss_order_id: Mapped[str | None] = mapped_column(String(100))  # Exchange SL order ID
     take_profit_price: Mapped[Decimal | None] = mapped_column(Numeric(30, 18))
+    take_profit_order_id: Mapped[str | None] = mapped_column(String(100))  # Exchange TP order ID
     trailing_stop_percent: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
 
     # PnL

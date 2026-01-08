@@ -65,7 +65,7 @@ async def list_signals(
     action: SignalAction | None = None,
     status_filter: SignalStatus | None = None,
     confidence: SignalConfidence | None = None,
-    hours: int = Query(24, ge=1, le=168),  # Default last 24 hours, max 7 days
+    hours: int = Query(168, ge=1, le=720),  # Default last 7 days, max 30 days
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> list[SignalResponse]:

@@ -218,6 +218,13 @@ class UserWhaleFollow(Base):
         String(20)
     )  # SPOT, FUTURES, or null for default
 
+    # Per-whale copy settings (override user defaults)
+    stop_loss_percent: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
+    take_profit_percent: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
+    leverage: Mapped[int | None] = mapped_column(Integer)
+    margin_mode: Mapped[str | None] = mapped_column(String(20))  # "CROSS" or "ISOLATED"
+    copy_leverage: Mapped[bool] = mapped_column(Boolean, default=False)  # Copy whale's leverage
+
     # Notifications
     notify_on_trade: Mapped[bool] = mapped_column(Boolean, default=True)
 

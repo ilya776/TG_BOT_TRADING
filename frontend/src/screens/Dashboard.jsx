@@ -760,9 +760,13 @@ function Dashboard() {
 function PositionCard({ position, index, onSell, isLoading }) {
   const [showActions, setShowActions] = useState(false)
   const pnl = Number(position.unrealized_pnl || 0)
-  const size = Number(position.entry_value_usdt || 0)
-  // Calculate pnlPercent if not provided by API
-  const pnlPercent = Number(position.unrealized_pnl_percent || 0) || (size > 0 ? (pnl / size) * 100 : 0)
+  const margin = Number(position.entry_value_usdt || 0)
+  const leverageNum = position.leverage || 1
+  const isFutures = position.position_type === 'FUTURES'
+  // Position size = margin * leverage for futures (notional value)
+  const size = isFutures ? margin * leverageNum : margin
+  // Calculate pnlPercent if not provided by API (use margin as base for %)
+  const pnlPercent = Number(position.unrealized_pnl_percent || 0) || (margin > 0 ? (pnl / margin) * 100 : 0)
   const isProfit = pnl >= 0
 
   return (
@@ -787,8 +791,8 @@ function PositionCard({ position, index, onSell, isLoading }) {
           <div>
             <div className="flex items-center gap-2">
               <span className="font-semibold text-white text-sm">{position.symbol}</span>
-              {/* Show SPOT for spot trades (no leverage or 1x), LONG/SHORT for futures */}
-              {(!position.leverage || position.leverage <= 1 || position.market_type === 'spot') ? (
+              {/* Show SPOT for spot trades, LONG/SHORT for futures - use position_type as source of truth */}
+              {position.position_type === 'SPOT' ? (
                 <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-biolum-cyan/20 text-biolum-cyan">
                   SPOT
                 </span>
@@ -801,7 +805,7 @@ function PositionCard({ position, index, onSell, isLoading }) {
                   {position.side === 'BUY' ? 'LONG' : 'SHORT'}
                 </span>
               )}
-              {position.leverage && position.leverage > 1 && (
+              {position.leverage && position.leverage >= 1 && position.position_type === 'FUTURES' && (
                 <span className="text-[10px] font-mono text-gray-500">
                   {position.leverage}x
                 </span>

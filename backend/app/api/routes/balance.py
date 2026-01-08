@@ -262,18 +262,27 @@ async def sync_exchange_balance(
 
         try:
             futures_balances = await executor.get_futures_balance()
-            for balance in futures_balances:
-                value_usdt = Decimal(str(balance.get("balance", 0)))
+            for bal in futures_balances:
+                # Balance object has: asset, free, locked, total
+                value_usdt = bal.total
                 futures_total += value_usdt
-                futures_available += Decimal(str(balance.get("available", 0)))
-                futures_pnl += Decimal(str(balance.get("unrealized_pnl", 0)))
+                futures_available += bal.free
 
                 if value_usdt > Decimal("0.01"):
                     futures_assets.append({
-                        "symbol": balance.get("asset", "USDT"),
-                        "quantity": str(balance.get("balance", 0)),
+                        "symbol": bal.asset,
+                        "quantity": str(bal.total),
                         "value_usdt": str(value_usdt),
                     })
+
+            # Get unrealized PnL from positions
+            try:
+                positions = await executor.get_open_positions()
+                for pos in positions:
+                    if pos.unrealized_pnl:
+                        futures_pnl += pos.unrealized_pnl
+            except Exception:
+                pass  # PnL is optional
         except Exception as e:
             futures_error = str(e)
             logger.warning(f"Failed to get futures balance for {exchange}: {e}")

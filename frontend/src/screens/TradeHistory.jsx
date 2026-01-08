@@ -84,8 +84,8 @@ function TradeHistory() {
       name: trade.symbol?.replace('USDT', '') || 'Unknown',
       side: trade.side === 'BUY' ? 'LONG' : 'SHORT',
       type: trade.trade_type || 'SPOT',
-      isSpot: !trade.leverage || trade.leverage <= 1 || trade.trade_type === 'SPOT',
-      leverage: trade.leverage && trade.leverage > 1 ? `${trade.leverage}x` : null,
+      isSpot: trade.trade_type === 'SPOT',
+      leverage: trade.leverage && trade.leverage >= 1 && trade.trade_type === 'FUTURES' ? `${trade.leverage}x` : null,
       entry: parseFloat(trade.executed_price || trade.requested_price || 0),
       exit: trade.status === 'FILLED' ? parseFloat(trade.executed_price || 0) : null,
       size: parseFloat(trade.trade_value_usdt || 0),
@@ -101,9 +101,13 @@ function TradeHistory() {
 
     const openPositions = (positions || []).map(pos => {
       const pnl = parseFloat(pos.unrealized_pnl || 0)
-      const size = parseFloat(pos.entry_value_usdt || 0)
+      const margin = parseFloat(pos.entry_value_usdt || 0)
+      const leverageNum = pos.leverage || 1
+      const isFutures = pos.position_type === 'FUTURES'
+      // Position size (notional) = margin * leverage for futures
+      const size = isFutures ? margin * leverageNum : margin
       // Calculate pnlPercent if not provided
-      const pnlPercent = parseFloat(pos.unrealized_pnl_percent || 0) || (size > 0 ? (pnl / size) * 100 : 0)
+      const pnlPercent = parseFloat(pos.unrealized_pnl_percent || 0) || (margin > 0 ? (pnl / margin) * 100 : 0)
 
       return {
         id: `pos-${pos.id}`,
@@ -113,12 +117,14 @@ function TradeHistory() {
         name: pos.symbol?.replace('USDT', '') || 'Unknown',
         side: pos.side === 'BUY' ? 'LONG' : 'SHORT',
         type: pos.position_type || 'SPOT',
-        isSpot: !pos.leverage || pos.leverage <= 1 || pos.position_type === 'SPOT' || pos.market_type === 'spot',
-        leverage: pos.leverage && pos.leverage > 1 ? `${pos.leverage}x` : null,
+        isSpot: pos.position_type === 'SPOT',
+        leverage: isFutures && leverageNum >= 1 ? `${leverageNum}x` : null,
+        leverageNum,
         entry: parseFloat(pos.entry_price || 0),
         currentPrice: parseFloat(pos.current_price || pos.entry_price || 0),
         exit: null,
-        size,
+        size, // Position size (notional for futures)
+        margin, // Actual margin used
         pnl,
         pnlPercent,
         whale: pos.whale_name || 'Whale',
