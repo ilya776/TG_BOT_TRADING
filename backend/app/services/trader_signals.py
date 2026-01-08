@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 import traceback
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -29,7 +30,83 @@ logger = logging.getLogger(__name__)
 
 # Retry configuration for network requests
 MAX_RETRIES = 3
-RETRY_DELAYS = [1, 2, 3]  # seconds between retries
+RETRY_DELAYS = [1, 2, 4]  # seconds between retries (exponential backoff)
+
+# ============================================================================
+# BITGET CIRCUIT BREAKER - Prevents cascading failures when API is down
+# ============================================================================
+# When Bitget API fails repeatedly (timeouts, 403s), the circuit opens and
+# all requests fail fast for a cooldown period. This prevents:
+# 1. Wasting time on requests that will fail
+# 2. Overloading the API with retries (making rate limits worse)
+# 3. Blocking worker threads with timeout waits
+
+class BitgetCircuitBreaker:
+    """Simple circuit breaker for Bitget API calls."""
+
+    FAILURE_THRESHOLD = 5  # Open circuit after 5 consecutive failures
+    COOLDOWN_SECONDS = 120  # Keep circuit open for 2 minutes
+
+    def __init__(self):
+        self._failures = 0
+        self._circuit_opened_at: Optional[float] = None
+        self._last_success_at: Optional[float] = None
+
+    @property
+    def is_open(self) -> bool:
+        """Check if circuit is open (blocking requests)."""
+        if self._circuit_opened_at is None:
+            return False
+
+        elapsed = time.time() - self._circuit_opened_at
+        if elapsed >= self.COOLDOWN_SECONDS:
+            # Cooldown expired - allow one request through (half-open state)
+            return False
+        return True
+
+    @property
+    def time_until_retry(self) -> float:
+        """Seconds until circuit allows requests again."""
+        if self._circuit_opened_at is None:
+            return 0
+        elapsed = time.time() - self._circuit_opened_at
+        return max(0, self.COOLDOWN_SECONDS - elapsed)
+
+    def record_success(self):
+        """Record a successful API call."""
+        self._failures = 0
+        self._circuit_opened_at = None
+        self._last_success_at = time.time()
+
+    def record_failure(self):
+        """Record a failed API call."""
+        self._failures += 1
+        if self._failures >= self.FAILURE_THRESHOLD:
+            if self._circuit_opened_at is None:
+                self._circuit_opened_at = time.time()
+                logger.warning(
+                    f"Bitget circuit breaker OPENED after {self._failures} failures. "
+                    f"Blocking requests for {self.COOLDOWN_SECONDS}s"
+                )
+
+    def reset(self):
+        """Reset circuit breaker (for testing)."""
+        self._failures = 0
+        self._circuit_opened_at = None
+
+
+# Global Bitget circuit breaker instance
+_bitget_circuit_breaker = BitgetCircuitBreaker()
+
+def get_bitget_circuit_breaker() -> BitgetCircuitBreaker:
+    """Get the global Bitget circuit breaker."""
+    return _bitget_circuit_breaker
+
+
+# FlareSolverr URL for Cloudflare bypass (used by Bitget fallback)
+FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://flaresolverr:8191/v1")
+
+
 RETRYABLE_EXCEPTIONS = (
     httpx.ConnectError,
     httpx.ReadError,
@@ -290,16 +367,17 @@ class TraderSignalService:
     def __init__(self):
         # Configure httpx with higher connection limits for parallel fetching
         # Default limits are too low for batch position fetching (50+ whales)
+        # Increased timeouts to reduce ReadTimeout errors during high load
         limits = httpx.Limits(
             max_keepalive_connections=100,  # Keep more connections alive
             max_connections=200,  # Allow more concurrent connections
-            keepalive_expiry=30.0,  # Keep connections alive for 30s
+            keepalive_expiry=60.0,  # Keep connections alive for 60s (increased from 30s)
         )
         timeout = httpx.Timeout(
-            connect=10.0,  # Connection timeout
-            read=30.0,  # Read timeout
-            write=10.0,  # Write timeout
-            pool=30.0,  # Pool wait timeout
+            connect=15.0,  # Connection timeout (increased from 10s)
+            read=45.0,  # Read timeout (increased from 30s to handle slow responses)
+            write=15.0,  # Write timeout (increased from 10s)
+            pool=45.0,  # Pool wait timeout (increased from 30s)
         )
         self.client = httpx.AsyncClient(
             timeout=timeout,
@@ -723,98 +801,204 @@ class TraderSignalService:
         """
         Fetch current positions for a Bitget copy trading master.
         Bitget copy traders ALWAYS share positions publicly.
-        Uses retry logic for network resilience.
+
+        Uses circuit breaker + fallback strategy:
+        1. Check circuit breaker - if open, fail fast
+        2. Try direct API with retry logic
+        3. If fails, try FlareSolverr fallback
+        4. Record success/failure for circuit breaker
+        """
+        positions = []
+        circuit_breaker = get_bitget_circuit_breaker()
+
+        # Fast fail if circuit is open
+        if circuit_breaker.is_open:
+            logger.debug(
+                f"Bitget circuit OPEN - skipping {trader_uid[:8]}... "
+                f"(retry in {circuit_breaker.time_until_retry:.0f}s)"
+            )
+            return positions
+
+        try:
+            # Try direct API first
+            positions = await self._fetch_bitget_positions_direct(trader_uid)
+
+            if positions:
+                circuit_breaker.record_success()
+                return positions
+
+            # Direct API returned empty - not a failure, could be no positions
+            # Only record failure on actual errors/timeouts
+            return positions
+
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+            # Network error - try FlareSolverr fallback
+            logger.warning(
+                f"Bitget direct API failed for {trader_uid[:8]}...: {type(e).__name__}. "
+                f"Trying FlareSolverr fallback..."
+            )
+
+            try:
+                positions = await self._fetch_bitget_positions_flaresolverr(trader_uid)
+                if positions:
+                    circuit_breaker.record_success()
+                    return positions
+            except Exception as fallback_error:
+                logger.debug(f"FlareSolverr fallback also failed: {fallback_error}")
+
+            # Both methods failed - record failure
+            circuit_breaker.record_failure()
+            return positions
+
+        except Exception as e:
+            logger.error(f"Unexpected error fetching Bitget positions: {e}")
+            circuit_breaker.record_failure()
+            return positions
+
+    async def _fetch_bitget_positions_direct(self, trader_uid: str) -> list[TraderPosition]:
+        """Fetch Bitget positions via direct API call."""
+        positions = []
+
+        # Use trace API for positions
+        url = "https://api.bitget.com/api/mix/v1/trace/currentTrack"
+
+        params = {
+            "traderUid": trader_uid,
+            "pageNo": "1",
+            "pageSize": "50"
+        }
+
+        # Use shorter timeout for circuit breaker pattern (fail fast)
+        response = await retry_on_network_error(
+            self.client.get,
+            url,
+            params=params,
+            max_retries=2,  # Fewer retries for faster failure detection
+        )
+
+        if response.status_code != 200:
+            logger.debug(f"Bitget positions API returned {response.status_code}")
+            return positions
+
+        data = response.json()
+        position_list = data.get("data", {}).get("list", [])
+
+        positions = self._parse_bitget_positions(position_list, trader_uid)
+        return positions
+
+    async def _fetch_bitget_positions_flaresolverr(self, trader_uid: str) -> list[TraderPosition]:
+        """
+        Fetch Bitget positions via FlareSolverr (Cloudflare bypass).
+        Used as fallback when direct API fails.
         """
         positions = []
 
         try:
-            # Use trace API for positions (same namespace as traderList)
+            # FlareSolverr request
             url = "https://api.bitget.com/api/mix/v1/trace/currentTrack"
+            params = f"?traderUid={trader_uid}&pageNo=1&pageSize=50"
 
-            params = {
-                "traderUid": trader_uid,
-                "pageNo": "1",
-                "pageSize": "50"
+            payload = {
+                "cmd": "request.get",
+                "url": url + params,
+                "maxTimeout": 30000,
             }
 
-            # Wrap HTTP call with retry logic for network errors
-            response = await retry_on_network_error(
-                self.client.get,
-                url,
-                params=params
-            )
+            async with httpx.AsyncClient(timeout=45.0) as flare_client:
+                response = await flare_client.post(FLARESOLVERR_URL, json=payload)
 
-            if response.status_code != 200:
-                logger.debug(f"Bitget positions API returned {response.status_code}")
-                return positions
+                if response.status_code != 200:
+                    logger.debug(f"FlareSolverr returned {response.status_code}")
+                    return positions
 
-            data = response.json()
-            position_list = data.get("data", {}).get("list", [])
+                result = response.json()
 
-            for item in position_list:
+                if result.get("status") != "ok":
+                    logger.debug(f"FlareSolverr error: {result.get('message')}")
+                    return positions
+
+                # Parse the response body
+                solution = result.get("solution", {})
+                body = solution.get("response", "")
+
+                # Try to parse as JSON
                 try:
-                    # Validate required fields
-                    is_valid, missing = self._validate_position_data(item, "bitget")
-                    if not is_valid:
-                        logger.warning(f"Bitget position missing required fields: {missing}")
-                        continue
+                    data = json.loads(body)
+                    position_list = data.get("data", {}).get("list", [])
+                    positions = self._parse_bitget_positions(position_list, trader_uid)
 
-                    # Bitget uses 'holdSide' for position side
-                    side = item.get("holdSide", "long").upper()
-                    if side not in ["LONG", "SHORT"]:
-                        side = "LONG" if "long" in side.lower() else "SHORT"
+                    if positions:
+                        logger.info(
+                            f"FlareSolverr SUCCESS: Fetched {len(positions)} positions "
+                            f"for Bitget trader {trader_uid[:8]}..."
+                        )
 
-                    # Bitget achievedProfits - check if it's decimal or percentage format
-                    # If < 1.0 and non-zero, it's likely decimal (0.02 = 2%)
-                    roe_raw = Decimal(str(item.get("achievedProfits", 0)))
-                    if abs(roe_raw) < Decimal("1.0") and roe_raw != 0:
-                        roe_value = roe_raw * 100  # Convert decimal to percentage
-                    else:
-                        roe_value = roe_raw  # Already percentage
-
-                    symbol = item.get("symbol", "").upper()
-                    # Detect futures type from symbol (DMCBL = COIN-M, UMCBL = USD-M)
-                    futures_type = detect_futures_type(symbol, "bitget")
-
-                    # Get position open time from Bitget API
-                    # cTime/ctime = creation time, uTime/utime = update time
-                    position_time = datetime.utcnow()
-                    for time_field in ["cTime", "ctime", "openTime", "uTime", "utime"]:
-                        if item.get(time_field):
-                            try:
-                                ts = int(item[time_field])
-                                # Handle milliseconds vs seconds
-                                if ts > 1e12:
-                                    ts = ts / 1000
-                                position_time = datetime.fromtimestamp(ts)
-                                break
-                            except (ValueError, TypeError):
-                                pass
-
-                    position = TraderPosition(
-                        symbol=symbol,
-                        side=side,
-                        entry_price=Decimal(str(item.get("openPriceAvg", item.get("averageOpenPrice", 0)))),
-                        mark_price=Decimal(str(item.get("marketPrice", 0))),
-                        size=Decimal(str(item.get("total", item.get("holdAmount", 0)))),
-                        pnl=Decimal(str(item.get("unrealizedPL", 0))),
-                        roe=roe_value,
-                        leverage=int(float(item.get("leverage", 1))),
-                        update_time=position_time,
-                        futures_type=futures_type,
-                    )
-                    positions.append(position)
-                except Exception as e:
-                    logger.warning(f"Error parsing Bitget position: {e}")
-
-            if positions:
-                logger.info(f"Fetched {len(positions)} positions for Bitget trader {trader_uid[:8]}...")
+                except json.JSONDecodeError:
+                    logger.debug(f"FlareSolverr response not JSON: {body[:100]}")
 
         except Exception as e:
-            logger.error(
-                f"Error fetching Bitget trader positions for {trader_uid[:8]}...: "
-                f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
-            )
+            logger.debug(f"FlareSolverr request failed: {e}")
+
+        return positions
+
+    def _parse_bitget_positions(self, position_list: list, trader_uid: str) -> list[TraderPosition]:
+        """Parse Bitget position data into TraderPosition objects."""
+        positions = []
+
+        for item in position_list:
+            try:
+                # Validate required fields
+                is_valid, missing = self._validate_position_data(item, "bitget")
+                if not is_valid:
+                    logger.warning(f"Bitget position missing required fields: {missing}")
+                    continue
+
+                # Bitget uses 'holdSide' for position side
+                side = item.get("holdSide", "long").upper()
+                if side not in ["LONG", "SHORT"]:
+                    side = "LONG" if "long" in side.lower() else "SHORT"
+
+                # Bitget achievedProfits - check if it's decimal or percentage format
+                roe_raw = Decimal(str(item.get("achievedProfits", 0)))
+                if abs(roe_raw) < Decimal("1.0") and roe_raw != 0:
+                    roe_value = roe_raw * 100  # Convert decimal to percentage
+                else:
+                    roe_value = roe_raw  # Already percentage
+
+                symbol = item.get("symbol", "").upper()
+                futures_type = detect_futures_type(symbol, "bitget")
+
+                # Get position open time from Bitget API
+                position_time = datetime.utcnow()
+                for time_field in ["cTime", "ctime", "openTime", "uTime", "utime"]:
+                    if item.get(time_field):
+                        try:
+                            ts = int(item[time_field])
+                            if ts > 1e12:
+                                ts = ts / 1000
+                            position_time = datetime.fromtimestamp(ts)
+                            break
+                        except (ValueError, TypeError):
+                            pass
+
+                position = TraderPosition(
+                    symbol=symbol,
+                    side=side,
+                    entry_price=Decimal(str(item.get("openPriceAvg", item.get("averageOpenPrice", 0)))),
+                    mark_price=Decimal(str(item.get("marketPrice", 0))),
+                    size=Decimal(str(item.get("total", item.get("holdAmount", 0)))),
+                    pnl=Decimal(str(item.get("unrealizedPL", 0))),
+                    roe=roe_value,
+                    leverage=int(float(item.get("leverage", 1))),
+                    update_time=position_time,
+                    futures_type=futures_type,
+                )
+                positions.append(position)
+            except Exception as e:
+                logger.warning(f"Error parsing Bitget position: {e}")
+
+        if positions:
+            logger.info(f"Fetched {len(positions)} positions for Bitget trader {trader_uid[:8]}...")
 
         return positions
 
@@ -1189,9 +1373,14 @@ class TraderSignalService:
                     # Update Redis cache
                     self._set_cached_positions(cache_key, current_positions)
 
-                    # Minimal delay to avoid rate limits (reduced from 3.0s to 0.3s for low-latency)
-                    # Rate limit errors are handled per-exchange with exponential backoff
-                    await asyncio.sleep(0.3)
+                    # Exchange-specific delays to avoid rate limits
+                    # Bitget has stricter rate limits, so we use longer delays
+                    if exchange == "BITGET":
+                        await asyncio.sleep(1.5)  # 1.5s for Bitget (stricter limits)
+                    elif exchange == "OKX":
+                        await asyncio.sleep(0.5)  # 0.5s for OKX
+                    else:
+                        await asyncio.sleep(0.3)  # 0.3s for Binance/Bybit
 
                 except Exception as e:
                     logger.error(f"Error checking trader {whale.name}: {e}")
