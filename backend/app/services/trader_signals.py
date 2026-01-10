@@ -24,6 +24,11 @@ from app.models.whale import Whale
 
 logger = logging.getLogger(__name__)
 
+
+class SharingDisabledException(Exception):
+    """Raised when trader has position sharing explicitly disabled."""
+    pass
+
 # Redis client for persistent position cache
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 _redis_client: Optional[redis.Redis] = None
@@ -150,21 +155,45 @@ class TraderSignalService:
             try:
                 data = response.json()
             except Exception:
-                logger.warning(f"Failed to parse Binance positions response")
+                logger.warning(f"Failed to parse Binance positions response for {encrypted_uid[:8]}...")
                 return positions
 
+            # Check success flag
             if not data.get("success"):
+                error_code = data.get("code")
+                error_msg = data.get("message", "")
+
+                # Specific error codes for sharing disabled
+                if error_code in [-1, "USER_NOT_FOUND", "POSITION_SHARING_DISABLED"]:
+                    logger.info(f"Binance trader {encrypted_uid[:8]} has sharing DISABLED (code: {error_code})")
+                    raise SharingDisabledException(f"Sharing disabled: {error_msg}")
+
+                logger.warning(f"Binance API error for {encrypted_uid[:8]}: {error_code} - {error_msg}")
                 return positions
 
-            # Handle None values - some traders have position sharing disabled
             data_obj = data.get("data") or {}
             position_list = data_obj.get("otherPositionRetList")
+
+            # THREE CASES:
+            # 1. None = might be disabled OR API error (ambiguous)
+            # 2. [] = sharing enabled, no positions (NORMAL)
+            # 3. [...] = has positions
+
             if position_list is None:
-                # Trader has position sharing disabled
+                logger.debug(f"Binance trader {encrypted_uid[:8]} returned None (ambiguous)")
+                return positions
+
+            if isinstance(position_list, list) and len(position_list) == 0:
+                logger.debug(f"Binance trader {encrypted_uid[:8]} has NO positions (sharing enabled)")
                 return positions
 
             for item in position_list:
                 try:
+                    # Log raw position data for debugging
+                    logger.debug(f"Binance position raw: symbol={item.get('symbol')}, amount={item.get('amount')}, "
+                                f"entryPrice={item.get('entryPrice')}, markPrice={item.get('markPrice')}, "
+                                f"leverage={item.get('leverage')}, pnl={item.get('pnl')}")
+
                     position = TraderPosition(
                         symbol=item.get("symbol", ""),
                         side="LONG" if item.get("amount", 0) > 0 else "SHORT",
@@ -176,6 +205,12 @@ class TraderSignalService:
                         leverage=int(item.get("leverage", 1)),
                         update_time=datetime.fromtimestamp(item.get("updateTimeStamp", 0) / 1000) if item.get("updateTimeStamp") else datetime.utcnow()
                     )
+
+                    # Keep positions with size=0 to track closed positions for CLOSE signals
+                    # They won't generate BUY signals but needed for comparison
+                    if position.size == 0:
+                        logger.debug(f"Binance position has ZERO size for {item.get('symbol')} (likely closed)")
+
                     positions.append(position)
                 except Exception as e:
                     logger.warning(f"Error parsing Binance position: {e}")
@@ -297,6 +332,79 @@ class TraderSignalService:
 
         return positions
 
+    async def fetch_okx_trader_positions(self, unique_code: str) -> list[TraderPosition]:
+        """
+        Fetch current positions for an OKX copy trading leader.
+        Uses public copy trading API.
+        """
+        positions = []
+
+        try:
+            url = "https://www.okx.com/api/v5/copytrading/public-current-subpositions"
+
+            params = {
+                "uniqueCode": unique_code,
+            }
+
+            response = await self.client.get(url, params=params)
+
+            if response.status_code != 200:
+                logger.debug(f"OKX positions API returned {response.status_code}")
+                return positions
+
+            data = response.json()
+            if data.get("code") != "0":
+                logger.debug(f"OKX positions API error: {data.get('msg')}")
+                return positions
+
+            position_list = data.get("data", [])
+
+            for item in position_list:
+                try:
+                    # Log raw position data for debugging
+                    logger.debug(f"OKX position raw: instId={item.get('instId')}, pos={item.get('pos')}, "
+                                f"posSide={item.get('posSide')}, openAvgPx={item.get('openAvgPx')}, "
+                                f"markPx={item.get('markPx')}, lever={item.get('lever')}, upl={item.get('upl')}")
+
+                    # OKX uses 'posSide' for position side (long/short/net)
+                    pos_side = item.get("posSide", "").lower()
+                    if pos_side == "long":
+                        side = "LONG"
+                    elif pos_side == "short":
+                        side = "SHORT"
+                    else:
+                        # For net mode, check pos value
+                        pos = Decimal(str(item.get("pos", "0")))
+                        side = "LONG" if pos > 0 else "SHORT"
+
+                    position = TraderPosition(
+                        symbol=item.get("instId", "").replace("-", ""),  # BTC-USDT -> BTCUSDT
+                        side=side,
+                        entry_price=Decimal(str(item.get("openAvgPx", 0))),
+                        mark_price=Decimal(str(item.get("markPx", 0))),
+                        size=abs(Decimal(str(item.get("pos", 0)))),
+                        pnl=Decimal(str(item.get("upl", 0))),
+                        roe=Decimal(str(item.get("uplRatio", 0))) * 100,  # Convert to percentage
+                        leverage=int(float(item.get("lever", 1))),
+                        update_time=datetime.fromtimestamp(int(item.get("uTime", 0)) / 1000) if item.get("uTime") else datetime.utcnow()
+                    )
+
+                    # Keep positions with size=0 to track closed positions for CLOSE signals
+                    if position.size == 0:
+                        logger.debug(f"OKX position has ZERO size for {item.get('instId')} (likely closed)")
+
+                    positions.append(position)
+                except Exception as e:
+                    logger.warning(f"Error parsing OKX position: {e}")
+
+            if positions:
+                logger.info(f"Fetched {len(positions)} positions for OKX trader {unique_code[:8]}...")
+
+        except Exception as e:
+            logger.error(f"Error fetching OKX trader positions: {e}")
+
+        return positions
+
     def _generate_tx_hash(self, whale_id: int, symbol: str, action: str, timestamp: datetime) -> str:
         """Generate a unique hash for the signal (since we don't have real tx hashes)."""
         data = f"{whale_id}:{symbol}:{action}:{timestamp.isoformat()}"
@@ -346,7 +454,8 @@ class TraderSignalService:
                     Whale.is_active == True,
                     Whale.wallet_address.like("binance_%") |
                     Whale.wallet_address.like("bybit_%") |
-                    Whale.wallet_address.like("bitget_%")
+                    Whale.wallet_address.like("bitget_%") |
+                    Whale.wallet_address.like("okx_%")
                 ).order_by(Whale.score.desc()).limit(max_traders)
             )
             whales = result.scalars().all()
@@ -372,6 +481,8 @@ class TraderSignalService:
                         current_positions = await self.fetch_bybit_trader_positions(uid)
                     elif exchange == "bitget":
                         current_positions = await self.fetch_bitget_trader_positions(uid)
+                    elif exchange == "okx":
+                        current_positions = await self.fetch_okx_trader_positions(uid)
                     else:
                         continue
 
@@ -459,6 +570,11 @@ class TraderSignalService:
             # Calculate position value in USD
             position_value = position.size * position.mark_price
 
+            # Skip signals with zero value (closed positions without cached size)
+            if position_value == 0:
+                logger.debug(f"Skipping signal for {whale.name} {position.symbol} - zero position value")
+                return None
+
             # Determine CEX symbol (remove USDT suffix for our format)
             cex_symbol = position.symbol
             if not cex_symbol.endswith("USDT"):
@@ -487,6 +603,7 @@ class TraderSignalService:
                 status=SignalStatus.PENDING,
                 detected_at=now,
                 tx_timestamp=position.update_time,
+                is_close=is_close,  # True when whale is closing a position
             )
 
             db.add(signal)

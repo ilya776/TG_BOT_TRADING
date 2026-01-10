@@ -1,0 +1,3389 @@
+
+       ENTERPRISE-LEVEL COPY TRADING BACKEND ARCHITECTURE
+
+       Executive Summary
+
+       After analyzing the exploration phase findings, I'm designing a Clean Architecture-based modular monolith that addresses all critical issues while
+       maintaining production stability through Branch by Abstraction migration strategy.
+
+       Critical Problems Identified
+
+       1. Copy Trade Engine: 762 LOC God Object with 8+ responsibilities, dead code (SignalQueue), circular dependencies
+       2. Exchange Executors: 70-80% code duplication, no retry logic, tight SDK coupling
+       3. Database Models: N+1 queries, fat models, missing indexes, no optimistic locking
+       4. Business Logic: Scattered in Celery workers instead of service layer
+       5. Transaction Management: Multiple commits, no isolation levels
+
+       Solution: Clean Architecture + Domain-Driven Design
+
+       Architecture Style: Clean Architecture (Hexagonal inspired)
+       Project Structure: Modular Monolith with clear bounded contexts
+       Migration Strategy: Branch by Abstraction (3+ months, zero downtime)
+
+       ---
+       1. HIGH-LEVEL ARCHITECTURE DIAGRAM
+
+       ┌─────────────────────────────────────────────────────────────────────┐
+       │                         PRESENTATION LAYER                          │
+       │                  (FastAPI Routes, WebSocket Handlers)                │
+       │                                                                      │
+       │  /api/v1/trades     /api/v1/signals     /api/v1/whales             │
+       │  /api/v1/positions  /api/v1/users       /webhook/*                  │
+       └────────────────────────────┬────────────────────────────────────────┘
+                                    │
+                                    v
+       ┌─────────────────────────────────────────────────────────────────────┐
+       │                         APPLICATION LAYER                           │
+       │                  (Use Cases, Commands, Queries, DTOs)                │
+       │                                                                      │
+       │  CopyTradeUseCase      ClosePositionCommand                          │
+       │  ProcessSignalQuery    SyncBalanceCommand                            │
+       │  FollowWhaleUseCase    GetPositionsQuery                             │
+       └────────────────────────────┬────────────────────────────────────────┘
+                                    │
+                                    v
+       ┌─────────────────────────────────────────────────────────────────────┐
+       │                           DOMAIN LAYER                              │
+       │              (Pure Business Logic, No Dependencies)                  │
+       │                                                                      │
+       │  Trading Context    Signal Context    Exchange Context              │
+       │  ├─ Trade           ├─ Signal         ├─ ExchangeAdapter            │
+       │  ├─ Position        ├─ SignalQueue    ├─ OrderExecutor              │
+       │  └─ TradePolicy     └─ SignalPolicy   └─ BalanceManager             │
+       │                                                                      │
+       │  User Context       Risk Context      Whale Context                 │
+       │  ├─ User            ├─ RiskPolicy     ├─ Whale                      │
+       │  ├─ APIKey          ├─ RiskCheck      ├─ WhaleFollow                │
+       │  └─ Settings        └─ LimitEnforcer  └─ WhaleStats                 │
+       │                                                                      │
+       │  Domain Events: TradeExecuted, PositionClosed, WhaleSignalDetected  │
+       └────────────────────────────┬────────────────────────────────────────┘
+                                    │
+                                    v
+       ┌─────────────────────────────────────────────────────────────────────┐
+       │                       INFRASTRUCTURE LAYER                          │
+       │            (Database, External APIs, Message Queues)                 │
+       │                                                                      │
+       │  Repositories       Exchange SDKs       External Services            │
+       │  ├─ TradeRepo       ├─ BinanceAdapter  ├─ NotificationService       │
+       │  ├─ PositionRepo    ├─ BybitAdapter    ├─ EncryptionService         │
+       │  └─ WhaleRepo       └─ BitgetAdapter   └─ CacheService              │
+       │                                                                      │
+       │  Unit of Work       Event Bus           Circuit Breakers            │
+       │  Transaction Mgmt   Domain Events       API Protection              │
+       └─────────────────────────────────────────────────────────────────────┘
+
+       ---
+       2. DIRECTORY STRUCTURE (NEW PROJECT)
+
+       backend_v2/
+       ├── alembic/                          # Database migrations
+       │   ├── versions/
+       │   └── env.py
+       │
+       ├── app/
+       │   ├── domain/                       # DOMAIN LAYER (Pure Business Logic)
+       │   │   ├── __init__.py
+       │   │   │
+       │   │   ├── trading/                  # Trading Bounded Context
+       │   │   │   ├── __init__.py
+       │   │   │   ├── entities/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── trade.py         # Trade Aggregate Root
+       │   │   │   │   ├── position.py      # Position Aggregate Root
+       │   │   │   │   └── order.py         # Order Value Object
+       │   │   │   ├── value_objects/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── trade_size.py
+       │   │   │   │   ├── price.py
+       │   │   │   │   ├── quantity.py
+       │   │   │   │   └── leverage.py
+       │   │   │   ├── policies/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── trade_execution_policy.py
+       │   │   │   │   ├── position_sizing_policy.py
+       │   │   │   │   └── leverage_policy.py
+       │   │   │   ├── events/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── trade_executed.py
+       │   │   │   │   ├── position_opened.py
+       │   │   │   │   ├── position_closed.py
+       │   │   │   │   └── stop_loss_triggered.py
+       │   │   │   └── exceptions/
+       │   │   │       ├── __init__.py
+       │   │   │       ├── insufficient_balance.py
+       │   │   │       └── invalid_trade_size.py
+       │   │   │
+       │   │   ├── signals/                  # Signal Bounded Context
+       │   │   │   ├── __init__.py
+       │   │   │   ├── entities/
+       │   │   │   │   ├── signal.py        # Signal Aggregate Root
+       │   │   │   │   └── signal_queue.py  # Signal Queue Aggregate
+       │   │   │   ├── value_objects/
+       │   │   │   │   ├── confidence_score.py
+       │   │   │   │   ├── signal_priority.py
+       │   │   │   │   └── whale_metadata.py
+       │   │   │   ├── policies/
+       │   │   │   │   ├── signal_priority_policy.py
+       │   │   │   │   ├── signal_deduplication_policy.py
+       │   │   │   │   └── signal_expiration_policy.py
+       │   │   │   └── events/
+       │   │   │       ├── signal_detected.py
+       │   │   │       ├── signal_processed.py
+       │   │   │       └── signal_expired.py
+       │   │   │
+       │   │   ├── exchanges/                # Exchange Bounded Context
+       │   │   │   ├── __init__.py
+       │   │   │   ├── entities/
+       │   │   │   │   ├── exchange_account.py
+       │   │   │   │   └── exchange_order.py
+       │   │   │   ├── value_objects/
+       │   │   │   │   ├── order_result.py
+       │   │   │   │   ├── balance.py
+       │   │   │   │   └── position_data.py
+       │   │   │   ├── ports/               # Interfaces (Dependency Inversion)
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── exchange_port.py  # Abstract Interface
+       │   │   │   │   ├── order_executor_port.py
+       │   │   │   │   └── balance_fetcher_port.py
+       │   │   │   └── exceptions/
+       │   │   │       ├── exchange_error.py
+       │   │   │       ├── circuit_breaker_open.py
+       │   │   │       └── rate_limit_exceeded.py
+       │   │   │
+       │   │   ├── users/                    # User Bounded Context
+       │   │   │   ├── __init__.py
+       │   │   │   ├── entities/
+       │   │   │   │   ├── user.py          # User Aggregate Root
+       │   │   │   │   ├── api_key.py       # API Key Entity
+       │   │   │   │   └── settings.py      # Settings Entity
+       │   │   │   ├── value_objects/
+       │   │   │   │   ├── balance.py
+       │   │   │   │   ├── subscription_tier.py
+       │   │   │   │   └── telegram_id.py
+       │   │   │   └── policies/
+       │   │   │       ├── subscription_policy.py
+       │   │   │       └── balance_policy.py
+       │   │   │
+       │   │   ├── risk/                     # Risk Bounded Context
+       │   │   │   ├── __init__.py
+       │   │   │   ├── entities/
+       │   │   │   │   ├── risk_profile.py
+       │   │   │   │   └── risk_limit.py
+       │   │   │   ├── value_objects/
+       │   │   │   │   ├── risk_check_result.py
+       │   │   │   │   └── exposure.py
+       │   │   │   ├── policies/
+       │   │   │   │   ├── position_limit_policy.py
+       │   │   │   │   ├── daily_loss_limit_policy.py
+       │   │   │   │   ├── leverage_limit_policy.py
+       │   │   │   │   └── balance_check_policy.py
+       │   │   │   └── services/
+       │   │   │       ├── risk_calculator.py
+       │   │   │       └── exposure_calculator.py
+       │   │   │
+       │   │   ├── whales/                   # Whale Bounded Context
+       │   │   │   ├── __init__.py
+       │   │   │   ├── entities/
+       │   │   │   │   ├── whale.py         # Whale Aggregate Root
+       │   │   │   │   ├── whale_follow.py  # Follow Relationship Entity
+       │   │   │   │   └── whale_stats.py   # Statistics Entity
+       │   │   │   ├── value_objects/
+       │   │   │   │   ├── whale_score.py
+       │   │   │   │   ├── sharing_status.py
+       │   │   │   │   └── priority_score.py
+       │   │   │   └── policies/
+       │   │   │       ├── whale_discovery_policy.py
+       │   │   │       ├── sharing_validation_policy.py
+       │   │   │       └── polling_frequency_policy.py
+       │   │   │
+       │   │   └── shared/                   # Shared Kernel (Cross-Context)
+       │   │       ├── __init__.py
+       │   │       ├── domain_event.py      # Base Domain Event
+       │   │       ├── aggregate_root.py    # Base Aggregate Root
+       │   │       ├── entity.py            # Base Entity
+       │   │       ├── value_object.py      # Base Value Object
+       │   │       └── specification.py     # Specification Pattern Base
+       │   │
+       │   ├── application/                  # APPLICATION LAYER (Use Cases)
+       │   │   ├── __init__.py
+       │   │   │
+       │   │   ├── trading/                  # Trading Use Cases
+       │   │   │   ├── __init__.py
+       │   │   │   ├── commands/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── execute_copy_trade.py
+       │   │   │   │   ├── close_position.py
+       │   │   │   │   ├── update_stop_loss.py
+       │   │   │   │   └── sync_position_with_exchange.py
+       │   │   │   ├── queries/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── get_user_trades.py
+       │   │   │   │   ├── get_open_positions.py
+       │   │   │   │   └── get_trade_history.py
+       │   │   │   ├── handlers/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── execute_copy_trade_handler.py
+       │   │   │   │   ├── close_position_handler.py
+       │   │   │   │   └── sync_position_handler.py
+       │   │   │   └── dtos/
+       │   │   │       ├── __init__.py
+       │   │   │       ├── trade_dto.py
+       │   │   │       ├── position_dto.py
+       │   │   │       └── execution_result_dto.py
+       │   │   │
+       │   │   ├── signals/                  # Signal Use Cases
+       │   │   │   ├── __init__.py
+       │   │   │   ├── commands/
+       │   │   │   │   ├── process_signal.py
+       │   │   │   │   ├── enqueue_signal.py
+       │   │   │   │   └── expire_stale_signals.py
+       │   │   │   ├── queries/
+       │   │   │   │   ├── get_pending_signals.py
+       │   │   │   │   ├── get_signal_by_id.py
+       │   │   │   │   └── get_user_signals.py
+       │   │   │   └── handlers/
+       │   │   │       ├── process_signal_handler.py
+       │   │   │       └── enqueue_signal_handler.py
+       │   │   │
+       │   │   ├── users/                    # User Use Cases
+       │   │   │   ├── __init__.py
+       │   │   │   ├── commands/
+       │   │   │   │   ├── update_settings.py
+       │   │   │   │   ├── add_api_key.py
+       │   │   │   │   └── sync_balance.py
+       │   │   │   └── queries/
+       │   │   │       ├── get_user.py
+       │   │   │       └── get_api_keys.py
+       │   │   │
+       │   │   ├── whales/                   # Whale Use Cases
+       │   │   │   ├── __init__.py
+       │   │   │   ├── commands/
+       │   │   │   │   ├── follow_whale.py
+       │   │   │   │   ├── unfollow_whale.py
+       │   │   │   │   └── update_follow_settings.py
+       │   │   │   └── queries/
+       │   │   │       ├── get_whales.py
+       │   │   │       └── get_followed_whales.py
+       │   │   │
+       │   │   └── shared/                   # Shared Application Layer
+       │   │       ├── __init__.py
+       │   │       ├── command.py           # Base Command
+       │   │       ├── query.py             # Base Query
+       │   │       ├── handler.py           # Base Handler
+       │   │       └── unit_of_work.py      # Unit of Work Interface
+       │   │
+       │   ├── infrastructure/               # INFRASTRUCTURE LAYER
+       │   │   ├── __init__.py
+       │   │   │
+       │   │   ├── persistence/              # Database Implementation
+       │   │   │   ├── __init__.py
+       │   │   │   ├── sqlalchemy/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── models/          # ORM Models (separate from domain!)
+       │   │   │   │   │   ├── __init__.py
+       │   │   │   │   │   ├── trade_model.py
+       │   │   │   │   │   ├── position_model.py
+       │   │   │   │   │   ├── signal_model.py
+       │   │   │   │   │   ├── user_model.py
+       │   │   │   │   │   └── whale_model.py
+       │   │   │   │   ├── repositories/    # Repository Implementations
+       │   │   │   │   │   ├── __init__.py
+       │   │   │   │   │   ├── trade_repository.py
+       │   │   │   │   │   ├── position_repository.py
+       │   │   │   │   │   ├── signal_repository.py
+       │   │   │   │   │   ├── user_repository.py
+       │   │   │   │   │   └── whale_repository.py
+       │   │   │   │   ├── mappers/         # Domain ↔ ORM Mapping
+       │   │   │   │   │   ├── __init__.py
+       │   │   │   │   │   ├── trade_mapper.py
+       │   │   │   │   │   ├── position_mapper.py
+       │   │   │   │   │   └── signal_mapper.py
+       │   │   │   │   ├── unit_of_work.py  # SQLAlchemy Unit of Work
+       │   │   │   │   └── session.py       # Session Management
+       │   │   │   │
+       │   │   │   └── cache/               # Redis Cache
+       │   │   │       ├── __init__.py
+       │   │   │       ├── signal_cache.py
+       │   │   │       ├── balance_cache.py
+       │   │   │       └── position_cache.py
+       │   │   │
+       │   │   ├── exchanges/                # Exchange Adapters (Ports Implementation)
+       │   │   │   ├── __init__.py
+       │   │   │   ├── adapters/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── binance_adapter.py    # Implements ExchangePort
+       │   │   │   │   ├── bybit_adapter.py
+       │   │   │   │   ├── bitget_adapter.py
+       │   │   │   │   └── okx_adapter.py
+       │   │   │   ├── factories/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   └── exchange_factory.py   # Factory Pattern
+       │   │   │   ├── strategies/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── spot_strategy.py      # Strategy Pattern
+       │   │   │   │   ├── futures_strategy.py
+       │   │   │   │   └── margin_strategy.py
+       │   │   │   ├── circuit_breakers/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── circuit_breaker.py
+       │   │   │   │   └── circuit_breaker_decorator.py
+       │   │   │   ├── retry/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── retry_policy.py
+       │   │   │   │   └── backoff_strategy.py
+       │   │   │   └── rate_limiters/
+       │   │   │       ├── __init__.py
+       │   │   │       ├── token_bucket.py
+       │   │   │       └── sliding_window.py
+       │   │   │
+       │   │   ├── messaging/                # Event Bus / Message Queue
+       │   │   │   ├── __init__.py
+       │   │   │   ├── event_bus.py         # In-Memory Event Bus
+       │   │   │   ├── celery_event_bus.py  # Celery-based Event Bus
+       │   │   │   └── event_handlers/
+       │   │   │       ├── __init__.py
+       │   │   │       ├── trade_executed_handler.py
+       │   │   │       ├── position_closed_handler.py
+       │   │   │       └── signal_detected_handler.py
+       │   │   │
+       │   │   ├── external/                 # External Services
+       │   │   │   ├── __init__.py
+       │   │   │   ├── encryption_service.py
+       │   │   │   ├── notification_service.py
+       │   │   │   └── telegram_service.py
+       │   │   │
+       │   │   └── monitoring/               # Observability
+       │   │       ├── __init__.py
+       │   │       ├── logger.py            # Structured Logging
+       │   │       ├── metrics.py           # Prometheus Metrics
+       │   │       └── tracer.py            # OpenTelemetry Tracing
+       │   │
+       │   ├── presentation/                 # PRESENTATION LAYER (API)
+       │   │   ├── __init__.py
+       │   │   ├── api/
+       │   │   │   ├── __init__.py
+       │   │   │   ├── v1/
+       │   │   │   │   ├── __init__.py
+       │   │   │   │   ├── routes/
+       │   │   │   │   │   ├── __init__.py
+       │   │   │   │   │   ├── trades.py
+       │   │   │   │   │   ├── positions.py
+       │   │   │   │   │   ├── signals.py
+       │   │   │   │   │   ├── whales.py
+       │   │   │   │   │   └── users.py
+       │   │   │   │   ├── schemas/         # Pydantic Schemas (API Contract)
+       │   │   │   │   │   ├── __init__.py
+       │   │   │   │   │   ├── trade_schema.py
+       │   │   │   │   │   ├── position_schema.py
+       │   │   │   │   │   └── signal_schema.py
+       │   │   │   │   └── dependencies.py  # FastAPI Dependencies
+       │   │   │   │
+       │   │   │   └── middleware/
+       │   │   │       ├── __init__.py
+       │   │   │       ├── auth_middleware.py
+       │   │   │       ├── error_handler.py
+       │   │   │       └── logging_middleware.py
+       │   │   │
+       │   │   └── workers/                  # Celery Workers (Async Handlers)
+       │   │       ├── __init__.py
+       │   │       ├── celery_app.py
+       │   │       └── tasks/
+       │   │           ├── __init__.py
+       │   │           ├── trade_tasks.py
+       │   │           ├── signal_tasks.py
+       │   │           └── monitoring_tasks.py
+       │   │
+       │   ├── config/                       # Configuration
+       │   │   ├── __init__.py
+       │   │   ├── settings.py              # Pydantic Settings
+       │   │   ├── database.py              # DB Config
+       │   │   └── logging_config.py        # Logging Config
+       │   │
+       │   └── main.py                       # Application Entry Point
+       │
+       ├── tests/                            # Tests (mirror structure)
+       │   ├── unit/
+       │   │   ├── domain/
+       │   │   ├── application/
+       │   │   └── infrastructure/
+       │   ├── integration/
+       │   │   ├── repositories/
+       │   │   └── exchanges/
+       │   ├── e2e/
+       │   │   └── copy_trade_flow_test.py
+       │   └── fixtures/
+       │
+       ├── docs/
+       │   ├── architecture/
+       │   │   ├── domain_model.md
+       │   │   ├── use_cases.md
+       │   │   └── migration_guide.md
+       │   └── api/
+       │       └── openapi.yaml
+       │
+       ├── scripts/
+       │   ├── migrate_data.py
+       │   └── generate_models.py
+       │
+       ├── Dockerfile
+       ├── docker-compose.yml
+       ├── requirements.txt
+       ├── pyproject.toml
+       └── README.md
+
+       ---
+       3. MODULE BREAKDOWN WITH RESPONSIBILITIES
+
+       3.1 Domain Layer Modules
+
+       Trading Context (domain/trading/)
+
+       Aggregate Root: Trade, Position
+
+       Responsibilities:
+       - Trade lifecycle management (PENDING → EXECUTING → FILLED/FAILED)
+       - Position state management (OPEN → CLOSED/LIQUIDATED)
+       - 2-phase commit coordination (reserve → execute → confirm/rollback)
+       - Stop-loss and take-profit logic
+       - Trade validation business rules
+
+       Key Classes:
+       # domain/trading/entities/trade.py
+       class Trade(AggregateRoot):
+           def reserve_balance(self, user_balance: Balance) -> None:
+               """Phase 1: Reserve funds for trade"""
+
+           def execute(self, order_result: OrderResult) -> None:
+               """Phase 2: Mark trade as executed"""
+
+           def fail(self, error: str) -> None:
+               """Rollback on failure"""
+
+           def can_be_executed(self) -> bool:
+               """Business rule: Trade must be in PENDING state"""
+
+       # domain/trading/entities/position.py
+       class Position(AggregateRoot):
+           def apply_stop_loss(self, current_price: Price) -> bool:
+               """Check if SL should trigger"""
+
+           def apply_take_profit(self, current_price: Price) -> bool:
+               """Check if TP should trigger"""
+
+           def calculate_pnl(self, current_price: Price) -> Decimal:
+               """Calculate unrealized P&L"""
+
+       ---
+       Signal Context (domain/signals/)
+
+       Aggregate Root: Signal, SignalQueue
+
+       Responsibilities:
+       - Signal priority calculation
+       - Signal deduplication
+       - Signal expiration logic
+       - Queue management with priority ordering
+
+       Key Classes:
+       # domain/signals/entities/signal.py
+       class Signal(AggregateRoot):
+           def calculate_priority(self, whale_score: int) -> int:
+               """Calculate signal priority (0-100)"""
+
+           def expire(self) -> None:
+               """Mark signal as expired after TTL"""
+
+           def is_duplicate(self, other: Signal) -> bool:
+               """Check if signal is duplicate"""
+
+       # domain/signals/entities/signal_queue.py
+       class SignalQueue(AggregateRoot):
+           """Per-user priority queue for signals"""
+
+           def enqueue(self, signal: Signal, priority: int) -> None:
+               """Add signal to queue with priority"""
+
+           def dequeue_highest_priority(self) -> Signal | None:
+               """Pop highest priority signal"""
+
+           def can_process(self, user_balance: Balance) -> bool:
+               """Early balance validation"""
+
+       ---
+       Exchange Context (domain/exchanges/)
+
+       No Aggregate Roots (pure ports/interfaces)
+
+       Responsibilities:
+       - Define exchange integration contracts (ports)
+       - Normalize exchange-specific data structures
+       - Circuit breaker state management
+
+       Key Interfaces:
+       # domain/exchanges/ports/exchange_port.py
+       class ExchangePort(ABC):
+           """Abstract interface for all exchanges"""
+
+           @abstractmethod
+           async def execute_spot_buy(self, symbol: str, quantity: Decimal) -> OrderResult:
+               pass
+
+           @abstractmethod
+           async def execute_futures_long(self, symbol: str, quantity: Decimal, leverage: int) -> OrderResult:
+               pass
+
+           @abstractmethod
+           async def close_position(self, symbol: str, position_side: PositionSide) -> OrderResult:
+               pass
+
+           @abstractmethod
+           async def get_balance(self) -> list[Balance]:
+               pass
+
+       ---
+       Risk Context (domain/risk/)
+
+       No Aggregate Roots (policies and services)
+
+       Responsibilities:
+       - Pre-trade risk validation
+       - Position limit enforcement
+       - Daily loss limit tracking
+       - Leverage limit checks
+
+       Key Classes:
+       # domain/risk/policies/position_limit_policy.py
+       class PositionLimitPolicy:
+           def check(self, user: User, current_positions: int) -> RiskCheckResult:
+               """Enforce max position limits based on subscription tier"""
+
+       # domain/risk/policies/daily_loss_limit_policy.py
+       class DailyLossLimitPolicy:
+           def check(self, user: User, daily_loss: Decimal) -> RiskCheckResult:
+               """Enforce daily loss limits"""
+
+       # domain/risk/services/risk_calculator.py
+       class RiskCalculator:
+           def calculate_safe_position_size(
+               self,
+               balance: Balance,
+               leverage: int,
+               exchange_minimums: dict
+           ) -> Decimal:
+               """Calculate safe position size respecting minimums"""
+
+       ---
+       3.2 Application Layer Modules
+
+       Trading Use Cases (application/trading/)
+
+       Responsibilities:
+       - Orchestrate domain logic
+       - Coordinate between multiple aggregates
+       - Transaction boundary management
+       - Event emission
+
+       Key Use Cases:
+
+       # application/trading/commands/execute_copy_trade.py
+       @dataclass
+       class ExecuteCopyTradeCommand:
+           signal_id: int
+           user_id: int
+           size_usdt_override: Decimal | None = None
+           exchange_override: str | None = None
+
+       class ExecuteCopyTradeHandler:
+           def __init__(
+               self,
+               trade_repo: TradeRepository,
+               position_repo: PositionRepository,
+               signal_repo: SignalRepository,
+               user_repo: UserRepository,
+               exchange_factory: ExchangeFactory,
+               risk_policies: list[RiskPolicy],
+               uow: UnitOfWork,
+               event_bus: EventBus,
+           ):
+               ...
+
+           async def handle(self, command: ExecuteCopyTradeCommand) -> ExecutionResult:
+               """
+               Orchestrate copy trade execution:
+               1. Load signal and validate
+               2. Load user and check balance
+               3. Run risk checks
+               4. Calculate trade size
+               5. Create PENDING trade
+               6. Commit transaction (Phase 1)
+               7. Execute on exchange
+               8. Update trade to FILLED/FAILED
+               9. Create/update position
+               10. Commit transaction (Phase 2)
+               11. Emit domain events
+               """
+               async with self.uow:
+                   # Load aggregates
+                   signal = await self.signal_repo.get_by_id(command.signal_id)
+                   user = await self.user_repo.get_by_id(command.user_id)
+
+                   # Risk checks
+                   for policy in self.risk_policies:
+                       result = policy.check(user, signal)
+                       if not result.allowed:
+                           return ExecutionResult.failure(result.reason)
+
+                   # Phase 1: Reserve
+                   trade = Trade.create_copy_trade(signal, user, ...)
+                   trade.reserve_balance(user.balance)
+                   await self.trade_repo.save(trade)
+                   await self.uow.commit()  # Commit Phase 1
+
+                   # Execute on exchange
+                   try:
+                       exchange = self.exchange_factory.create(user.preferred_exchange)
+                       order_result = await exchange.execute_trade(...)
+
+                       # Phase 2: Confirm
+                       trade.execute(order_result)
+                       position = Position.create_from_trade(trade, order_result)
+                       await self.position_repo.save(position)
+                       await self.uow.commit()  # Commit Phase 2
+
+                       # Emit events
+                       self.event_bus.publish(TradeExecutedEvent(trade))
+
+                       return ExecutionResult.success(trade)
+
+                   except ExchangeError as e:
+                       # Rollback
+                       trade.fail(str(e))
+                       user.balance.restore(trade.reserved_amount)
+                       await self.uow.commit()
+                       return ExecutionResult.failure(str(e))
+
+       ---
+       3.3 Infrastructure Layer Modules
+
+       Exchange Adapters (infrastructure/exchanges/adapters/)
+
+       Responsibilities:
+       - Implement ExchangePort interface
+       - Normalize exchange-specific APIs
+       - Handle SDK quirks (Binance SDK vs CCXT)
+       - Circuit breaker integration
+       - Retry logic with exponential backoff
+
+       Key Implementation:
+
+       # infrastructure/exchanges/adapters/binance_adapter.py
+       class BinanceAdapter(ExchangePort):
+           """Binance-specific implementation of ExchangePort"""
+
+           def __init__(
+               self,
+               api_key: str,
+               api_secret: str,
+               circuit_breaker: CircuitBreaker,
+               retry_policy: RetryPolicy,
+           ):
+               self._client = AsyncClient(api_key, api_secret)
+               self._circuit_breaker = circuit_breaker
+               self._retry_policy = retry_policy
+
+           @retry_with_backoff()  # Decorator for retry logic
+           @circuit_breaker_protected()  # Decorator for circuit breaker
+           async def execute_spot_buy(self, symbol: str, quantity: Decimal) -> OrderResult:
+               """Execute spot buy on Binance"""
+               # Normalize symbol (remove "-" and "/")
+               binance_symbol = self._normalize_symbol(symbol)
+
+               # Binance-specific API call
+               response = await self._client.order_market_buy(
+                   symbol=binance_symbol,
+                   quantity=str(quantity),
+               )
+
+               # Map Binance response to domain OrderResult
+               return OrderResultMapper.from_binance(response)
+
+           async def execute_futures_long(self, symbol: str, quantity: Decimal, leverage: int) -> OrderResult:
+               """Execute futures long on Binance"""
+               # Set leverage first
+               await self._client.futures_change_leverage(symbol=symbol, leverage=leverage)
+
+               # Place order
+               response = await self._client.futures_create_order(
+                   symbol=symbol,
+                   side="BUY",
+                   type="MARKET",
+                   quantity=str(quantity),
+               )
+
+               return OrderResultMapper.from_binance_futures(response)
+
+       Strategy Pattern for Trading Modes
+
+       # infrastructure/exchanges/strategies/spot_strategy.py
+       class SpotTradingStrategy:
+           """Strategy for spot trading execution"""
+
+           async def execute_buy(self, adapter: ExchangePort, params: TradeParams) -> OrderResult:
+               return await adapter.execute_spot_buy(params.symbol, params.quantity)
+
+       # infrastructure/exchanges/strategies/futures_strategy.py
+       class FuturesTradingStrategy:
+           """Strategy for futures trading execution"""
+
+           async def execute_long(self, adapter: ExchangePort, params: TradeParams) -> OrderResult:
+               # Set leverage first
+               await adapter.set_leverage(params.symbol, params.leverage)
+               return await adapter.execute_futures_long(params.symbol, params.quantity, params.leverage)
+
+       # Usage in Use Case
+       strategy = self.strategy_factory.create(trade_type)
+       result = await strategy.execute(exchange, params)
+
+       Unified Retry Logic
+
+       # infrastructure/exchanges/retry/retry_policy.py
+       class ExponentialBackoffRetry:
+           """Exponential backoff retry policy"""
+
+           def __init__(self, max_retries: int = 3, base_delay: float = 1.0):
+               self.max_retries = max_retries
+               self.base_delay = base_delay
+
+           async def execute(self, func, *args, **kwargs):
+               """Execute function with exponential backoff"""
+               for attempt in range(self.max_retries):
+                   try:
+                       return await func(*args, **kwargs)
+                   except (RateLimitError, TemporaryError) as e:
+                       if attempt == self.max_retries - 1:
+                           raise
+                       delay = self.base_delay * (2 ** attempt)
+                       logger.warning(f"Retry {attempt + 1}/{self.max_retries} after {delay}s: {e}")
+                       await asyncio.sleep(delay)
+
+       # Decorator
+       def retry_with_backoff(policy: RetryPolicy = ExponentialBackoffRetry()):
+           def decorator(func):
+               @wraps(func)
+               async def wrapper(*args, **kwargs):
+                   return await policy.execute(func, *args, **kwargs)
+               return wrapper
+           return decorator
+
+       ---
+       Repository Pattern with Mappers
+
+       # infrastructure/persistence/sqlalchemy/repositories/trade_repository.py
+       class TradeRepository(TradeRepositoryPort):
+           """SQLAlchemy implementation of TradeRepository"""
+
+           def __init__(self, session: AsyncSession, mapper: TradeMapper):
+               self._session = session
+               self._mapper = mapper
+
+           async def save(self, trade: Trade) -> None:
+               """Save domain Trade to database"""
+               # Convert domain entity to ORM model
+               trade_model = self._mapper.to_model(trade)
+               self._session.add(trade_model)
+
+           async def get_by_id(self, trade_id: int) -> Trade | None:
+               """Get Trade by ID, return domain entity"""
+               result = await self._session.execute(
+                   select(TradeModel).where(TradeModel.id == trade_id)
+               )
+               trade_model = result.scalar_one_or_none()
+
+               if not trade_model:
+                   return None
+
+               # Convert ORM model to domain entity
+               return self._mapper.to_entity(trade_model)
+
+           async def get_user_pending_trades(self, user_id: int) -> list[Trade]:
+               """Get all PENDING trades for user"""
+               result = await self._session.execute(
+                   select(TradeModel)
+                   .where(
+                       TradeModel.user_id == user_id,
+                       TradeModel.status == "PENDING"
+                   )
+                   .options(selectinload(TradeModel.signal))  # Eager load to avoid N+1
+               )
+               trade_models = result.scalars().all()
+               return [self._mapper.to_entity(model) for model in trade_models]
+
+
+       # infrastructure/persistence/sqlalchemy/mappers/trade_mapper.py
+       class TradeMapper:
+           """Maps between Trade domain entity and TradeModel ORM"""
+
+           def to_entity(self, model: TradeModel) -> Trade:
+               """Convert ORM model to domain entity"""
+               return Trade(
+                   id=TradeId(model.id),
+                   user_id=UserId(model.user_id),
+                   signal_id=SignalId(model.signal_id) if model.signal_id else None,
+                   symbol=Symbol(model.symbol),
+                   side=TradeSide(model.side),
+                   quantity=Quantity(model.quantity),
+                   status=TradeStatus(model.status),
+                   executed_price=Price(model.executed_price) if model.executed_price else None,
+                   # ... map all fields
+               )
+
+           def to_model(self, entity: Trade) -> TradeModel:
+               """Convert domain entity to ORM model"""
+               return TradeModel(
+                   id=entity.id.value if entity.id else None,
+                   user_id=entity.user_id.value,
+                   signal_id=entity.signal_id.value if entity.signal_id else None,
+                   symbol=entity.symbol.value,
+                   side=entity.side.value,
+                   quantity=entity.quantity.value,
+                   status=entity.status.value,
+                   executed_price=entity.executed_price.value if entity.executed_price else None,
+                   # ... map all fields
+               )
+
+       ---
+       Unit of Work Pattern
+
+       # infrastructure/persistence/sqlalchemy/unit_of_work.py
+       class SQLAlchemyUnitOfWork(UnitOfWork):
+           """SQLAlchemy implementation of Unit of Work pattern"""
+
+           def __init__(self, session_factory: Callable[[], AsyncSession]):
+               self._session_factory = session_factory
+               self._session: AsyncSession | None = None
+
+           async def __aenter__(self):
+               self._session = self._session_factory()
+               return self
+
+           async def __aexit__(self, exc_type, exc_val, exc_tb):
+               if exc_type:
+                   await self.rollback()
+               await self._session.close()
+
+           async def commit(self):
+               """Commit transaction"""
+               await self._session.commit()
+
+           async def rollback(self):
+               """Rollback transaction"""
+               await self._session.rollback()
+
+           @property
+           def trades(self) -> TradeRepository:
+               """Get trade repository"""
+               return TradeRepository(self._session, TradeMapper())
+
+           @property
+           def positions(self) -> PositionRepository:
+               """Get position repository"""
+               return PositionRepository(self._session, PositionMapper())
+
+       # Usage
+       async with uow:
+           trade = await uow.trades.get_by_id(trade_id)
+           trade.execute(order_result)
+           await uow.commit()  # Single commit for entire operation
+
+       ---
+       4. DESIGN PATTERNS IMPLEMENTATION
+
+       4.1 Strategy Pattern (Exchange Executors)
+
+       Problem: 70-80% code duplication between exchange executors
+
+       Solution: Extract common logic into strategies
+
+       # Old (Duplicated):
+       class BinanceExecutor:
+           async def spot_market_buy(self, symbol, quantity):
+               # Normalize symbol
+               # Round quantity
+               # Execute API call
+               # Parse response
+               # Handle errors
+
+       class BybitExecutor:
+           async def spot_market_buy(self, symbol, quantity):
+               # SAME normalize symbol logic
+               # SAME round quantity logic
+               # Different API call
+               # SAME parse response logic
+               # SAME error handling
+
+       # New (Strategy Pattern):
+       class TradingStrategy(ABC):
+           @abstractmethod
+           async def execute(self, adapter: ExchangePort, params: TradeParams) -> OrderResult:
+               pass
+
+       class SpotBuyStrategy(TradingStrategy):
+           async def execute(self, adapter: ExchangePort, params: TradeParams) -> OrderResult:
+               # Common normalization
+               normalized_symbol = self._normalize_symbol(params.symbol)
+               rounded_qty = self._round_quantity(params.quantity, adapter.get_symbol_info())
+
+               # Adapter-specific execution
+               return await adapter.execute_spot_buy(normalized_symbol, rounded_qty)
+
+       # Usage
+       strategy = SpotBuyStrategy()
+       result = await strategy.execute(binance_adapter, params)
+       result = await strategy.execute(bybit_adapter, params)  # Same strategy, different adapter!
+
+       ---
+       4.2 Factory Pattern (Exchange Creation)
+
+       # infrastructure/exchanges/factories/exchange_factory.py
+       class ExchangeFactory:
+           """Factory for creating exchange adapters"""
+
+           def __init__(
+               self,
+               circuit_breaker_factory: CircuitBreakerFactory,
+               retry_policy_factory: RetryPolicyFactory,
+           ):
+               self._circuit_breaker_factory = circuit_breaker_factory
+               self._retry_policy_factory = retry_policy_factory
+
+           def create(
+               self,
+               exchange_name: str,
+               api_key: str,
+               api_secret: str,
+               passphrase: str | None = None,
+           ) -> ExchangePort:
+               """Create exchange adapter with circuit breaker and retry logic"""
+
+               circuit_breaker = self._circuit_breaker_factory.create(exchange_name)
+               retry_policy = self._retry_policy_factory.create()
+
+               match exchange_name.lower():
+                   case "binance":
+                       return BinanceAdapter(api_key, api_secret, circuit_breaker, retry_policy)
+                   case "bybit":
+                       return BybitAdapter(api_key, api_secret, circuit_breaker, retry_policy)
+                   case "bitget":
+                       return BitgetAdapter(api_key, api_secret, circuit_breaker, retry_policy)
+                   case "okx":
+                       return OKXAdapter(api_key, api_secret, passphrase, circuit_breaker, retry_policy)
+                   case _:
+                       raise ValueError(f"Unsupported exchange: {exchange_name}")
+
+       ---
+       4.3 Command Pattern (Trade Operations)
+
+       # domain/trading/commands/trade_command.py
+       class TradeCommand(ABC):
+           """Abstract trade command for undo/redo support"""
+
+           @abstractmethod
+           async def execute(self) -> OrderResult:
+               pass
+
+           @abstractmethod
+           async def undo(self) -> None:
+               pass
+
+       class ExecuteMarketBuyCommand(TradeCommand):
+           """Command to execute market buy"""
+
+           def __init__(
+               self,
+               exchange: ExchangePort,
+               symbol: str,
+               quantity: Decimal,
+               trade_repo: TradeRepository,
+           ):
+               self._exchange = exchange
+               self._symbol = symbol
+               self._quantity = quantity
+               self._trade_repo = trade_repo
+               self._executed_trade: Trade | None = None
+
+           async def execute(self) -> OrderResult:
+               """Execute trade"""
+               order_result = await self._exchange.execute_spot_buy(self._symbol, self._quantity)
+               self._executed_trade = Trade.from_order_result(order_result)
+               await self._trade_repo.save(self._executed_trade)
+               return order_result
+
+           async def undo(self) -> None:
+               """Undo trade (close position)"""
+               if self._executed_trade:
+                   close_result = await self._exchange.execute_spot_sell(self._symbol, self._quantity)
+                   # ... update trade record
+
+       # Command Queue for retry
+       class TradeCommandQueue:
+           """Queue for trade commands with retry support"""
+
+           def __init__(self):
+               self._queue: Queue[TradeCommand] = Queue()
+
+           async def enqueue(self, command: TradeCommand):
+               await self._queue.put(command)
+
+           async def process(self):
+               """Process commands with retry"""
+               while True:
+                   command = await self._queue.get()
+                   try:
+                       await command.execute()
+                   except TemporaryError:
+                       # Re-queue for retry
+                       await self._queue.put(command)
+
+       ---
+       4.4 Domain Events Pattern
+
+       # domain/shared/domain_event.py
+       @dataclass
+       class DomainEvent(ABC):
+           """Base domain event"""
+           occurred_at: datetime = field(default_factory=datetime.utcnow)
+           event_id: str = field(default_factory=lambda: str(uuid4()))
+
+       # domain/trading/events/trade_executed.py
+       @dataclass
+       class TradeExecutedEvent(DomainEvent):
+           """Event: Trade was successfully executed"""
+           trade_id: int
+           user_id: int
+           symbol: str
+           quantity: Decimal
+           executed_price: Decimal
+           exchange: str
+
+       # infrastructure/messaging/event_bus.py
+       class EventBus:
+           """In-memory event bus for domain events"""
+
+           def __init__(self):
+               self._handlers: dict[Type[DomainEvent], list[Callable]] = {}
+
+           def subscribe(self, event_type: Type[DomainEvent], handler: Callable):
+               """Subscribe handler to event type"""
+               if event_type not in self._handlers:
+                   self._handlers[event_type] = []
+               self._handlers[event_type].append(handler)
+
+           async def publish(self, event: DomainEvent):
+               """Publish event to all subscribers"""
+               handlers = self._handlers.get(type(event), [])
+               for handler in handlers:
+                   await handler(event)
+
+       # Event Handler
+       class SendTradeNotificationHandler:
+           """Handler: Send notification when trade is executed"""
+
+           async def handle(self, event: TradeExecutedEvent):
+               """Send Telegram notification"""
+               await telegram_service.send_message(
+                   user_id=event.user_id,
+                   text=f"Trade executed: {event.symbol} @ {event.executed_price}"
+               )
+
+       # Setup
+       event_bus = EventBus()
+       event_bus.subscribe(TradeExecutedEvent, SendTradeNotificationHandler().handle)
+
+       # Usage in Use Case
+       async with uow:
+           trade.execute(order_result)
+           await uow.commit()
+           await event_bus.publish(TradeExecutedEvent(...))  # Decouple notification from trade logic
+
+       ---
+       4.5 Saga Pattern (Distributed Transactions)
+
+       # application/trading/sagas/copy_trade_saga.py
+       class CopyTradeSaga:
+           """
+           Saga for copy trade execution with compensating transactions.
+
+           Steps:
+           1. Reserve balance → Compensate: Restore balance
+           2. Execute on exchange → Compensate: Cancel order if possible
+           3. Create position → Compensate: Close position
+           4. Send notification → Compensate: None (idempotent)
+           """
+
+           def __init__(
+               self,
+               user_repo: UserRepository,
+               trade_repo: TradeRepository,
+               position_repo: PositionRepository,
+               exchange_factory: ExchangeFactory,
+               uow: UnitOfWork,
+           ):
+               self._user_repo = user_repo
+               self._trade_repo = trade_repo
+               self._position_repo = position_repo
+               self._exchange_factory = exchange_factory
+               self._uow = uow
+               self._compensations: list[Callable] = []
+
+           async def execute(self, command: ExecuteCopyTradeCommand) -> SagaResult:
+               """Execute saga with compensation on failure"""
+
+               try:
+                   # Step 1: Reserve balance
+                   user = await self._user_repo.get_by_id(command.user_id)
+                   trade = Trade.create_pending(...)
+                   trade.reserve_balance(user.balance)
+                   await self._trade_repo.save(trade)
+                   await self._uow.commit()
+
+                   # Register compensation
+                   self._compensations.append(
+                       lambda: self._restore_balance(user, trade.reserved_amount)
+                   )
+
+                   # Step 2: Execute on exchange
+                   exchange = self._exchange_factory.create(user.preferred_exchange)
+                   order_result = await exchange.execute_trade(...)
+
+                   # Register compensation
+                   self._compensations.append(
+                       lambda: exchange.cancel_order(order_result.order_id)
+                   )
+
+                   # Step 3: Create position
+                   trade.execute(order_result)
+                   position = Position.create_from_trade(trade)
+                   await self._position_repo.save(position)
+                   await self._uow.commit()
+
+                   # Success - clear compensations
+                   self._compensations.clear()
+                   return SagaResult.success(trade)
+
+               except Exception as e:
+                   # Failure - run compensations in reverse order
+                   await self._compensate()
+                   return SagaResult.failure(str(e))
+
+           async def _compensate(self):
+               """Run compensating transactions in reverse order"""
+               for compensation in reversed(self._compensations):
+                   try:
+                       await compensation()
+                   except Exception as e:
+                       logger.error(f"Compensation failed: {e}")
+
+       ---
+       5. DATABASE SCHEMA CHANGES
+
+       5.1 New Indexes
+
+       -- Composite indexes for common queries
+       CREATE INDEX ix_trades_user_status_created ON trades(user_id, status, created_at DESC);
+       CREATE INDEX ix_positions_user_status_symbol ON positions(user_id, status, symbol);
+       CREATE INDEX ix_signals_status_priority_created ON whale_signals(status, priority, detected_at DESC);
+       CREATE INDEX ix_whales_exchange_status_priority ON whales(exchange, data_status, priority_score DESC);
+
+       -- Covering indexes (include columns)
+       CREATE INDEX ix_trades_user_covering ON trades(user_id) INCLUDE (status, executed_price, quantity, created_at);
+       CREATE INDEX ix_positions_user_covering ON positions(user_id, status) INCLUDE (symbol, unrealized_pnl, current_price);
+
+       5.2 Optimistic Locking (Version Fields)
+
+       -- Add version columns for optimistic locking
+       ALTER TABLE trades ADD COLUMN version INT NOT NULL DEFAULT 1;
+       ALTER TABLE positions ADD COLUMN version INT NOT NULL DEFAULT 1;
+       ALTER TABLE users ADD COLUMN version INT NOT NULL DEFAULT 1;
+
+       -- Trigger to auto-increment version on update
+       CREATE OR REPLACE FUNCTION increment_version()
+       RETURNS TRIGGER AS $$
+       BEGIN
+           NEW.version = OLD.version + 1;
+           RETURN NEW;
+       END;
+       $$ LANGUAGE plpgsql;
+
+       CREATE TRIGGER trades_version_trigger
+       BEFORE UPDATE ON trades
+       FOR EACH ROW
+       EXECUTE FUNCTION increment_version();
+
+       5.3 Transaction Isolation Levels
+
+       # infrastructure/persistence/sqlalchemy/session.py
+       class SessionManager:
+           """Manage database sessions with proper isolation levels"""
+
+           async def create_session(
+               self,
+               isolation_level: IsolationLevel = IsolationLevel.READ_COMMITTED
+           ) -> AsyncSession:
+               """Create session with specified isolation level"""
+
+               engine = create_async_engine(
+                   DATABASE_URL,
+                   isolation_level=isolation_level.value,
+                   pool_size=20,
+                   max_overflow=10,
+               )
+
+               async_session = sessionmaker(
+                   engine,
+                   class_=AsyncSession,
+                   expire_on_commit=False,
+               )
+
+               return async_session()
+
+       # Usage
+       # For copy trades (high concurrency)
+       session = await session_manager.create_session(IsolationLevel.SERIALIZABLE)
+
+       # For read queries
+       session = await session_manager.create_session(IsolationLevel.READ_COMMITTED)
+
+       5.4 Materialized Views for Analytics
+
+       -- Materialized view for user portfolio summary
+       CREATE MATERIALIZED VIEW user_portfolio_summary AS
+       SELECT
+           u.id AS user_id,
+           u.total_balance,
+           u.available_balance,
+           COUNT(DISTINCT p.id) AS open_positions_count,
+           SUM(p.unrealized_pnl) AS total_unrealized_pnl,
+           SUM(CASE WHEN p.unrealized_pnl > 0 THEN 1 ELSE 0 END) AS winning_positions,
+           SUM(CASE WHEN p.unrealized_pnl < 0 THEN 1 ELSE 0 END) AS losing_positions
+       FROM users u
+       LEFT JOIN positions p ON u.id = p.user_id AND p.status = 'OPEN'
+       GROUP BY u.id, u.total_balance, u.available_balance;
+
+       CREATE UNIQUE INDEX ON user_portfolio_summary(user_id);
+
+       -- Refresh periodically
+       REFRESH MATERIALIZED VIEW CONCURRENTLY user_portfolio_summary;
+
+       ---
+       6. MIGRATION STRATEGY: BRANCH BY ABSTRACTION
+
+       Phase 1: Foundation (Week 1-4)
+
+       Objective: Set up new architecture without touching production code
+
+       Tasks:
+       1. Create new directory structure (backend_v2/)
+       2. Set up domain layer (entities, value objects, events)
+       3. Implement base classes (AggregateRoot, Repository, UnitOfWork)
+       4. Set up testing infrastructure
+       5. Create abstraction interfaces for existing services
+
+       Abstraction Layer:
+       # app/services/abstractions/trade_service_port.py
+       class TradeServicePort(ABC):
+           """Abstract interface for trade service (old and new can implement)"""
+
+           @abstractmethod
+           async def execute_copy_trade(
+               self,
+               signal_id: int,
+               user_id: int | None = None,
+               **kwargs
+           ) -> CopyTradeResult:
+               pass
+
+       # Old implementation (adapter)
+       class LegacyTradeService(TradeServicePort):
+           """Adapter for existing CopyTradeEngine"""
+
+           def __init__(self):
+               self._engine = CopyTradeEngine  # Existing code
+
+           async def execute_copy_trade(self, signal_id, user_id=None, **kwargs):
+               # Delegate to existing implementation
+               return await self._engine.process_signal(...)
+
+       # New implementation
+       class NewTradeService(TradeServicePort):
+           """New Clean Architecture implementation"""
+
+           def __init__(self, use_case_handler: ExecuteCopyTradeHandler):
+               self._handler = use_case_handler
+
+           async def execute_copy_trade(self, signal_id, user_id=None, **kwargs):
+               command = ExecuteCopyTradeCommand(signal_id, user_id, **kwargs)
+               return await self._handler.handle(command)
+
+       # Feature flag to switch implementations
+       @router.post("/trades/copy/{signal_id}")
+       async def copy_trade(signal_id: int, ...):
+           if settings.use_new_trade_service:
+               service = NewTradeService(...)
+           else:
+               service = LegacyTradeService(...)
+
+           return await service.execute_copy_trade(signal_id, ...)
+
+       Deliverables:
+       - ✅ New project structure created
+       - ✅ Domain models defined
+       - ✅ Unit tests for domain logic
+       - ✅ Abstraction layer for existing services
+
+       ---
+       Phase 2: Exchange Integration (Week 5-8)
+
+       Objective: Rewrite exchange executors with unified interface
+
+       Tasks:
+       1. Implement ExchangePort interface
+       2. Create Binance/Bybit/Bitget adapters
+       3. Implement retry logic with exponential backoff
+       4. Implement circuit breaker pattern
+       5. Add comprehensive integration tests
+
+       Parallel Execution Pattern:
+       # Run old and new in parallel, compare results (Canary Deployment)
+       class ParallelExchangeExecutor:
+           """Execute on both old and new, compare results"""
+
+           def __init__(
+               self,
+               old_executor: OldBinanceExecutor,
+               new_adapter: BinanceAdapter,
+           ):
+               self._old = old_executor
+               self._new = new_adapter
+
+           async def execute_spot_buy(self, symbol, quantity):
+               # Execute on both
+               old_result, new_result = await asyncio.gather(
+                   self._old.spot_market_buy(symbol, quantity),
+                   self._new.execute_spot_buy(symbol, quantity),
+                   return_exceptions=True
+               )
+
+               # Compare results
+               if not self._results_match(old_result, new_result):
+                   logger.warning(f"Result mismatch: old={old_result}, new={new_result}")
+                   # Send alert
+
+               # Return old result (production), but we validated new
+               return old_result
+
+       Deliverables:
+       - ✅ All exchange adapters implemented
+       - ✅ 100% test coverage for exchange logic
+       - ✅ Retry + circuit breaker working
+       - ✅ Parallel execution validation passed
+
+       ---
+       Phase 3: Trading Core (Week 9-12)
+
+       Objective: Rewrite copy trade engine and position management
+
+       Tasks:
+       1. Implement Trading bounded context
+       2. Create Trade and Position aggregates
+       3. Implement 2-phase commit with saga pattern
+       4. Create use case handlers
+       5. Implement Unit of Work pattern
+
+       Shadow Mode:
+       # Run new implementation in shadow mode (dry-run)
+       async def execute_copy_trade_with_shadow(signal_id, user_id):
+           # Execute OLD implementation (production)
+           old_result = await legacy_trade_service.execute(signal_id, user_id)
+
+           # Execute NEW implementation (shadow - dry run)
+           try:
+               new_result = await new_trade_service.execute_dry_run(signal_id, user_id)
+
+               # Compare results
+               if not results_match(old_result, new_result):
+                   logger.warning(f"Shadow execution mismatch: {diff(old_result, new_result)}")
+                   metrics.increment("shadow_mismatch")
+           except Exception as e:
+               logger.error(f"Shadow execution failed: {e}")
+               metrics.increment("shadow_error")
+
+           # Return production result
+           return old_result
+
+       Gradual Rollout:
+       # Feature flag with percentage rollout
+       def should_use_new_service(user_id: int) -> bool:
+           """Gradually roll out new service to users"""
+           rollout_percentage = int(os.getenv("NEW_SERVICE_ROLLOUT", "0"))  # 0-100
+
+           # Deterministic: same user always gets same result
+           user_hash = hash(user_id) % 100
+           return user_hash < rollout_percentage
+
+       # Usage
+       if should_use_new_service(user.id):
+           result = await new_trade_service.execute(...)
+       else:
+           result = await legacy_trade_service.execute(...)
+
+       Rollout Plan:
+       - Week 9-10: Shadow mode (0% real traffic)
+       - Week 11: 10% canary rollout
+       - Week 12: 50% rollout
+       - Week 13: 100% rollout
+
+       Deliverables:
+       - ✅ Copy trade engine rewritten
+       - ✅ Shadow mode validation successful
+       - ✅ 10% canary successful (no errors)
+       - ✅ 100% traffic on new system
+
+       ---
+       Phase 4: Signal Processing (Week 13-16)
+
+       Objective: Rewrite signal generation and queue management
+
+       Tasks:
+       1. Implement Signal bounded context
+       2. Rewrite SignalQueue (currently dead code)
+       3. Implement priority queue with Redis
+       4. Create signal processing use cases
+
+       Data Migration:
+       # Migrate existing signals to new format
+       async def migrate_signals():
+           """Migrate old WhaleSignal format to new Signal format"""
+
+           old_signals = await legacy_db.fetch_all("SELECT * FROM whale_signals WHERE status = 'PENDING'")
+
+           for old_signal in old_signals:
+               # Map old format to new domain model
+               new_signal = Signal.create(
+                   whale_id=WhaleId(old_signal['whale_id']),
+                   symbol=Symbol(old_signal['cex_symbol']),
+                   action=SignalAction(old_signal['action']),
+                   confidence=ConfidenceScore(old_signal['confidence_score']),
+                   # ... map all fields
+               )
+
+               # Save to new table (parallel)
+               await new_signal_repo.save(new_signal)
+
+       Deliverables:
+       - ✅ Signal processing rewritten
+       - ✅ SignalQueue implemented and used
+       - ✅ Data migration successful
+       - ✅ No signal processing delays
+
+       ---
+       Phase 5: Risk Management (Week 17-20)
+
+       Objective: Extract risk management into separate bounded context
+
+       Tasks:
+       1. Implement Risk bounded context
+       2. Create risk policy objects
+       3. Implement risk calculation services
+       4. Integrate with trading use cases
+
+       Deliverables:
+       - ✅ Risk policies implemented
+       - ✅ Integration tests passed
+       - ✅ No false positives in production
+
+       ---
+       Phase 6: Cleanup & Optimization (Week 21-24)
+
+       Objective: Remove legacy code and optimize
+
+       Tasks:
+       1. Remove legacy code (old CopyTradeEngine)
+       2. Remove abstraction layer
+       3. Optimize database queries
+       4. Performance testing
+       5. Documentation
+
+       Legacy Code Removal:
+       # Remove old files
+       rm -rf backend/app/services/copy_trade_engine.py
+       rm -rf backend/app/services/signal_queue.py  # Dead code
+       rm -rf backend/app/services/exchanges/binance_executor.py  # Old implementation
+
+       # Update imports throughout codebase
+       # Use automated refactoring tools
+
+       Deliverables:
+       - ✅ All legacy code removed
+       - ✅ Performance improved (< 5s trade execution)
+       - ✅ Test coverage > 80%
+       - ✅ Documentation complete
+
+       ---
+       7. TESTING STRATEGY
+
+       7.1 Unit Tests (Domain Layer)
+
+       # tests/unit/domain/trading/test_trade_aggregate.py
+       class TestTradeAggregate:
+           """Unit tests for Trade aggregate (pure business logic)"""
+
+           def test_reserve_balance_success(self):
+               # Arrange
+               trade = Trade.create_pending(...)
+               user_balance = Balance(Decimal("1000"))
+
+               # Act
+               trade.reserve_balance(user_balance)
+
+               # Assert
+               assert trade.status == TradeStatus.PENDING
+               assert user_balance.value == Decimal("900")  # 100 reserved
+
+           def test_reserve_balance_insufficient_funds(self):
+               # Arrange
+               trade = Trade.create_pending(trade_size=Decimal("1000"))
+               user_balance = Balance(Decimal("500"))
+
+               # Act & Assert
+               with pytest.raises(InsufficientBalanceError):
+                   trade.reserve_balance(user_balance)
+
+           def test_execute_trade_success(self):
+               # Arrange
+               trade = Trade.create_pending(...)
+               order_result = OrderResult(...)
+
+               # Act
+               trade.execute(order_result)
+
+               # Assert
+               assert trade.status == TradeStatus.FILLED
+               assert trade.executed_price == order_result.avg_fill_price
+
+       7.2 Integration Tests (Infrastructure Layer)
+
+       # tests/integration/infrastructure/exchanges/test_binance_adapter.py
+       @pytest.mark.integration
+       class TestBinanceAdapter:
+           """Integration tests for Binance adapter (requires testnet API keys)"""
+
+           async def test_execute_spot_buy_integration(self, binance_testnet_adapter):
+               # Arrange
+               symbol = Symbol("BTCUSDT")
+               quantity = Quantity(Decimal("0.001"))
+
+               # Act
+               result = await binance_testnet_adapter.execute_spot_buy(symbol, quantity)
+
+               # Assert
+               assert result.status == OrderStatus.FILLED
+               assert result.symbol == "BTCUSDT"
+               assert result.order_id is not None
+
+           async def test_retry_on_rate_limit(self, binance_testnet_adapter, monkeypatch):
+               # Simulate rate limit error
+               monkeypatch.setattr(
+                   binance_testnet_adapter._client,
+                   "order_market_buy",
+                   AsyncMock(side_effect=[
+                       RateLimitError("Rate limited"),
+                       RateLimitError("Rate limited"),
+                       {"orderId": "12345", ...}  # Success on 3rd try
+                   ])
+               )
+
+               # Should retry and succeed
+               result = await binance_testnet_adapter.execute_spot_buy(...)
+               assert result.order_id == "12345"
+
+       7.3 Contract Tests (Exchange APIs)
+
+       # tests/contract/test_exchange_contracts.py
+       class TestExchangeContracts:
+           """Contract tests to validate exchange API assumptions"""
+
+           @pytest.mark.parametrize("exchange_adapter", [
+               BinanceAdapter(...),
+               BybitAdapter(...),
+               BitgetAdapter(...),
+           ])
+           async def test_all_exchanges_implement_port(self, exchange_adapter):
+               """All adapters must implement ExchangePort"""
+               assert isinstance(exchange_adapter, ExchangePort)
+
+           @pytest.mark.parametrize("exchange_adapter", [
+               BinanceAdapter(...),
+               BybitAdapter(...),
+               BitgetAdapter(...),
+           ])
+           async def test_spot_buy_returns_valid_result(self, exchange_adapter):
+               """All exchanges return OrderResult with required fields"""
+               result = await exchange_adapter.execute_spot_buy("BTCUSDT", Decimal("0.001"))
+
+               assert isinstance(result, OrderResult)
+               assert result.order_id is not None
+               assert result.symbol is not None
+               assert result.filled_quantity > 0
+
+       7.4 E2E Tests (Critical Flows)
+
+       # tests/e2e/test_copy_trade_flow.py
+       @pytest.mark.e2e
+       class TestCopyTradeFlow:
+           """End-to-end test for full copy trade flow"""
+
+           async def test_complete_copy_trade_flow(
+               self,
+               test_db,
+               test_user,
+               test_whale,
+               test_signal,
+               binance_testnet
+           ):
+               """Test complete flow: Signal → Copy Trade → Position Creation"""
+
+               # Arrange: User follows whale with auto-copy enabled
+               await follow_whale_use_case.handle(
+                   FollowWhaleCommand(
+                       user_id=test_user.id,
+                       whale_id=test_whale.id,
+                       auto_copy_enabled=True,
+                       trade_size_usdt=Decimal("100"),
+                   )
+               )
+
+               # Act: Process signal
+               result = await process_signal_use_case.handle(
+                   ProcessSignalCommand(signal_id=test_signal.id)
+               )
+
+               # Assert: Trade executed successfully
+               assert result.success
+               assert result.trade_id is not None
+
+               # Verify trade in database
+               trade = await trade_repo.get_by_id(result.trade_id)
+               assert trade.status == TradeStatus.FILLED
+               assert trade.user_id == test_user.id
+
+               # Verify position created
+               positions = await position_repo.get_user_open_positions(test_user.id)
+               assert len(positions) == 1
+               assert positions[0].symbol == test_signal.symbol
+
+               # Verify balance deducted
+               user = await user_repo.get_by_id(test_user.id)
+               assert user.available_balance == test_user.initial_balance - Decimal("100")
+
+       ---
+       8. OBSERVABILITY & MONITORING
+
+       8.1 Structured Logging
+
+       # infrastructure/monitoring/logger.py
+       import structlog
+
+       logger = structlog.get_logger()
+
+       # Usage in Use Case
+       async def handle(self, command: ExecuteCopyTradeCommand):
+           logger.info(
+               "copy_trade.started",
+               signal_id=command.signal_id,
+               user_id=command.user_id,
+               trade_size=str(command.size_usdt_override),
+           )
+
+           try:
+               result = await self._execute(command)
+
+               logger.info(
+                   "copy_trade.completed",
+                   signal_id=command.signal_id,
+                   user_id=command.user_id,
+                   trade_id=result.trade_id,
+                   execution_time_ms=result.execution_time,
+               )
+
+               return result
+
+           except Exception as e:
+               logger.error(
+                   "copy_trade.failed",
+                   signal_id=command.signal_id,
+                   user_id=command.user_id,
+                   error=str(e),
+                   exc_info=True,
+               )
+               raise
+
+       8.2 Prometheus Metrics
+
+       # infrastructure/monitoring/metrics.py
+       from prometheus_client import Counter, Histogram, Gauge
+
+       # Counters
+       trades_executed_total = Counter(
+           'trades_executed_total',
+           'Total trades executed',
+           ['exchange', 'status']
+       )
+
+       # Histograms (for latency)
+       trade_execution_duration = Histogram(
+           'trade_execution_duration_seconds',
+           'Trade execution duration',
+           ['exchange', 'trade_type']
+       )
+
+       # Gauges
+       active_positions = Gauge(
+           'active_positions',
+           'Number of active positions',
+           ['user_id', 'exchange']
+       )
+
+       # Usage
+       @trade_execution_duration.labels(exchange="binance", trade_type="spot").time()
+       async def execute_trade(...):
+           ...
+           trades_executed_total.labels(exchange="binance", status="success").inc()
+
+       8.3 Distributed Tracing (OpenTelemetry)
+
+       # infrastructure/monitoring/tracer.py
+       from opentelemetry import trace
+       from opentelemetry.exporter.jaeger import JaegerExporter
+       from opentelemetry.sdk.trace import TracerProvider
+
+       tracer = trace.get_tracer(__name__)
+
+       # Usage
+       async def handle(self, command: ExecuteCopyTradeCommand):
+           with tracer.start_as_current_span("execute_copy_trade") as span:
+               span.set_attribute("signal_id", command.signal_id)
+               span.set_attribute("user_id", command.user_id)
+
+               # Child spans for sub-operations
+               with tracer.start_span("validate_risk"):
+                   await self._validate_risk(...)
+
+               with tracer.start_span("execute_on_exchange"):
+                   await self._execute_on_exchange(...)
+
+       ---
+       9. RISK MITIGATION
+
+       9.1 Potential Risks
+
+
+       ┌────────────────────────────────┬────────────┬──────────┬───────────────────────────────────────────────────────────────────────────────┐
+       │              Risk              │ Likelihood │  Impact  │                              Mitigation Strategy                              │
+       ├────────────────────────────────┼────────────┼──────────┼───────────────────────────────────────────────────────────────────────────────┤
+       │ Data loss during migration     │ Low        │ Critical │ • Parallel write to old + new DB• Comprehensive backups• Rollback plan        │
+       ├────────────────────────────────┼────────────┼──────────┼───────────────────────────────────────────────────────────────────────────────┤
+       │ Performance regression         │ Medium     │ High     │ • Load testing before rollout• Performance benchmarks• Gradual rollout        │
+       ├────────────────────────────────┼────────────┼──────────┼───────────────────────────────────────────────────────────────────────────────┤
+       │ Exchange API changes           │ Medium     │ High     │ • Contract tests• Circuit breakers• Fallback to old implementation            │
+       ├────────────────────────────────┼────────────┼──────────┼───────────────────────────────────────────────────────────────────────────────┤
+       │ Circular dependencies reappear │ Low        │ Medium   │ • Dependency Inversion Principle• Automated architecture tests• Code reviews  │
+       ├────────────────────────────────┼────────────┼──────────┼───────────────────────────────────────────────────────────────────────────────┤
+       │ Team learning curve            │ High       │ Medium   │ • Comprehensive documentation• Pair programming• Code review guidelines       │
+       ├────────────────────────────────┼────────────┼──────────┼───────────────────────────────────────────────────────────────────────────────┤
+       │ Production incidents           │ Medium     │ Critical │ • Feature flags for instant rollback• Shadow mode validation• 24/7 monitoring │
+       └────────────────────────────────┴────────────┴──────────┴───────────────────────────────────────────────────────────────────────────────┘
+       9.2 Rollback Strategy
+
+       # Instant rollback via feature flag
+       if settings.use_legacy_trade_engine:
+           # Rollback activated - use old code
+           return await legacy_copy_trade_engine.process_signal(...)
+       else:
+           # New code
+           return await new_trade_service.execute(...)
+
+       # Database rollback
+       # Keep old tables during migration
+       # - trades_old
+       # - positions_old
+       # Can query old data if needed
+
+       # Alembic downgrade
+       alembic downgrade -1  # Rollback last migration
+
+       ---
+       10. CRITICAL PATH (Implementation Order)
+
+       Must Implement First:
+
+       1. Domain Layer Foundation (Week 1-2)
+         - Aggregate roots
+         - Value objects
+         - Domain events
+       2. Infrastructure Layer Core (Week 2-4)
+         - Repository pattern
+         - Unit of Work
+         - Database session management
+       3. Exchange Adapters (Week 5-8)
+         - CRITICAL: All exchange logic must work perfectly
+         - Retry logic is essential
+         - Circuit breakers prevent cascading failures
+       4. Trading Core (Week 9-12)
+         - Copy trade execution
+         - 2-phase commit
+         - Position management
+
+       Can Implement Later:
+
+       - Signal processing (existing code works)
+       - Risk management (can use existing temporarily)
+       - Whale discovery (low priority)
+       - Analytics/reporting
+
+       ---
+       FINAL RECOMMENDATIONS
+
+       Architecture Decision: Clean Architecture + Modular Monolith
+
+       Why:
+       - Clear separation of concerns
+       - Testable domain logic
+       - Easy to evolve to microservices later if needed
+       - Maintains deployment simplicity
+
+       Migration Strategy: Branch by Abstraction
+
+       Why:
+       - Zero downtime
+       - Gradual rollout with rollback capability
+       - Validate new code in production with shadow mode
+       - Risk-averse approach suitable for financial system
+
+       Timeline: 3-6 Months
+
+       - Realistic: Complex system with production traffic
+       - Phased: Can deploy improvements incrementally
+       - Safe: Plenty of time for testing and validation
+
+       Success Metrics:
+
+       - ✅ Zero data loss
+       - ✅ < 5s trade execution time (down from current)
+       - ✅ 100% exchange API success rate (with retry)
+       - ✅ No circular dependencies (automated check)
+       - ✅ Test coverage > 80%
+       - ✅ No production incidents during migration
+
+       ---
+       Critical Files for Implementation
+
+       The following files are most critical for implementing this architecture plan:
+
+       - backend_v2/app/domain/trading/entities/trade.py - Core Trade aggregate with business logic, 2-phase commit pattern
+       - backend_v2/app/domain/exchanges/ports/exchange_port.py - Abstract interface defining exchange contract (Dependency Inversion)
+       - backend_v2/app/application/trading/handlers/execute_copy_trade_handler.py - Main use case orchestrating copy trade flow
+       - backend_v2/app/infrastructure/exchanges/adapters/binance_adapter.py - Reference implementation showing Strategy + Adapter patterns
+       - backend_v2/app/infrastructure/persistence/sqlalchemy/unit_of_work.py - Transaction management and repository coordination
+
+       These files form the foundation of the Clean Architecture and demonstrate the key patterns (Domain-Driven Design, Strategy, Factory, Repository,
+       Unit of Work) that solve the identified problems.
+  ⎿  Done (16 tool uses · 137.4k tokens · 5m 36s)
+  ⎿  PostToolUse:Task hook succeeded: Success
+
+∴ Thinking…
+
+  The user is still in plan mode and I've completed the comprehensive exploration and planning phases. Now I need to:
+
+  1. Review the comprehensive architecture plan that was generated
+  2. Create the final plan file at /Users/illabilous/.claude/plans/generic-churning-metcalfe.md
+  3. Use ExitPlanMode to signal that planning is complete
+
+  Let me read the architecture plan that was generated and create a concise, actionable plan file.
+
+  The plan agent created an extremely comprehensive architecture document. I need to distill this into a clear, executable plan in the plan file, then call
+  ExitPlanMode.
+
+⏺ Чудово! План агент створив дуже детальну enterprise архітектуру. Зараз я створю фінальний план файл з найважливішими деталями для виконання.
+
+⏺ Updated plan
+  ⎿  PreToolUse:Write hook succeeded
+  ⎿  PreToolUse:Write hook succeeded: Success
+  ⎿  Wrote 740 lines to /Users/illabilous/.claude/plans/generic-churning-metcalfe.md
+        1 # План повного переписування Backend Copy Trading системи
+        2
+        3 ## Executive Summary
+        4
+        5 **Статус**: Staging/розробка, можна почати з нуля
+        6 **Timeline**: 3-6 місяців (enterprise-level rewrite)
+        7 **Стратегія**: Branch by Abstraction - нова архітектура паралельно зі старою, поступовий перехід
+        8 **Архітектура**: Clean Architecture + Domain-Driven Design (modular monolith)
+        9
+       10 ---
+       11
+       12 ## Критичні проблеми (виявлені під час exploration)
+       13
+       14 ### Copy Trade Engine:
+       15 - ❌ SignalQueue написаний (257 LOC) але НЕ використовується
+       16 - ❌ God Object CopyTradeEngine (762 LOC, 8+ responsibilities)
+       17 - ❌ Циркулярні залежності (copy_trade_engine ↔ trade_tasks)
+       18 - ❌ 7 критичних багів (balance double-counting, fee calculation, position value drift)
+       19 - ❌ Немає reconciliation для NEEDS_RECONCILIATION trades
+       20
+       21 ### Exchange Executors:
+       22 - ❌ 70-80% дублювання коду між Binance/Bybit/Bitget
+       23 - ❌ НЕМАЄ retry logic взагалі
+       24 - ❌ Немає unified interface для copy trading services
+       25 - ❌ Inconsistent rate limiting (тільки в Bybit)
+       26 - ❌ Tight coupling до SDKs (Binance SDK vs CCXT)
+       27
+       28 ### Database Models:
+       29 - ❌ N+1 queries через lazy loading
+       30 - ❌ Business logic у Celery workers замість service layer
+       31 - ❌ Циклічна залежність (OnChainWallet → Whale)
+       32 - ❌ Fat Models з business logic
+       33 - ❌ Відсутність composite indexes
+       34 - ❌ No optimistic locking (missing version fields)
+       35
+       36 ---
+       37
+       38 ## Нова архітектура (Clean Architecture)
+       39
+       40 ```
+       41 ┌─────────────────────────────────────────────┐
+       42 │         PRESENTATION LAYER                  │
+       43 │    (FastAPI Routes, Celery Workers)         │
+       44 └──────────────────┬──────────────────────────┘
+       45                    │
+       46 ┌──────────────────▼──────────────────────────┐
+       47 │         APPLICATION LAYER                   │
+       48 │  (Use Cases, Commands, Queries, Handlers)   │
+       49 │                                             │
+       50 │  ExecuteCopyTradeHandler                    │
+       51 │  ClosePositionHandler                       │
+       52 │  ProcessSignalHandler                       │
+       53 └──────────────────┬──────────────────────────┘
+       54                    │
+       55 ┌──────────────────▼──────────────────────────┐
+       56 │           DOMAIN LAYER                      │
+       57 │    (Pure Business Logic, Zero Dependencies) │
+       58 │                                             │
+       59 │  Bounded Contexts:                          │
+       60 │  • Trading (Trade, Position)                │
+       61 │  • Signals (Signal, SignalQueue)            │
+       62 │  • Exchanges (Ports/Interfaces)             │
+       63 │  • Users (User, APIKey, Settings)           │
+       64 │  • Risk (RiskPolicy, RiskCheck)             │
+       65 │  • Whales (Whale, WhaleFollow)              │
+       66 │                                             │
+       67 │  Domain Events:                             │
+       68 │  • TradeExecuted, PositionClosed            │
+       69 │  • SignalDetected, StopLossTriggered        │
+       70 └──────────────────┬──────────────────────────┘
+       71                    │
+       72 ┌──────────────────▼──────────────────────────┐
+       73 │       INFRASTRUCTURE LAYER                  │
+       74 │  (Database, External APIs, Message Queue)   │
+       75 │                                             │
+       76 │  • Repositories (SQLAlchemy)                │
+       77 │  • Exchange Adapters (Binance, Bybit...)    │
+       78 │  • Unit of Work (Transaction Management)    │
+       79 │  • Event Bus (Domain Events)                │
+       80 │  • Circuit Breakers, Retry Logic            │
+       81 └─────────────────────────────────────────────┘
+       82 ```
+       83
+       84 ---
+       85
+       86 ## Directory Structure (нова)
+       87
+       88 ```
+       89 backend_v2/
+       90 ├── app/
+       91 │   ├── domain/                    # DOMAIN LAYER (чиста бізнес-логіка)
+       92 │   │   ├── trading/               # Trading Bounded Context
+       93 │   │   │   ├── entities/          # Trade, Position (Aggregate Roots)
+       94 │   │   │   ├── value_objects/     # TradeSize, Price, Quantity
+       95 │   │   │   ├── policies/          # TradingPolicy, PositionSizingPolicy
+       96 │   │   │   ├── events/            # TradeExecuted, PositionClosed
+       97 │   │   │   └── exceptions/        # InsufficientBalance, InvalidTradeSize
+       98 │   │   ├── signals/               # Signal Bounded Context
+       99 │   │   │   ├── entities/          # Signal, SignalQueue
+      100 │   │   │   ├── policies/          # PriorityPolicy, DeduplicationPolicy
+      101 │   │   │   └── events/            # SignalDetected, SignalProcessed
+      102 │   │   ├── exchanges/             # Exchange Bounded Context
+      103 │   │   │   ├── ports/             # ExchangePort (Abstract Interface)
+      104 │   │   │   ├── value_objects/     # OrderResult, Balance
+      105 │   │   │   └── exceptions/        # ExchangeError, CircuitBreakerOpen
+      106 │   │   ├── users/                 # User Bounded Context
+      107 │   │   ├── risk/                  # Risk Bounded Context
+      108 │   │   ├── whales/                # Whale Bounded Context
+      109 │   │   └── shared/                # Shared Kernel (base classes)
+      110 │   │
+      111 │   ├── application/               # APPLICATION LAYER (use cases)
+      112 │   │   ├── trading/
+      113 │   │   │   ├── commands/          # ExecuteCopyTrade, ClosePosition
+      114 │   │   │   ├── queries/           # GetUserTrades, GetOpenPositions
+      115 │   │   │   ├── handlers/          # ExecuteCopyTradeHandler
+      116 │   │   │   └── dtos/              # TradeDTO, PositionDTO
+      117 │   │   ├── signals/
+      118 │   │   ├── users/
+      119 │   │   ├── whales/
+      120 │   │   └── shared/                # BaseCommand, BaseQuery, UnitOfWork
+      121 │   │
+      122 │   ├── infrastructure/            # INFRASTRUCTURE LAYER
+      123 │   │   ├── persistence/
+      124 │   │   │   └── sqlalchemy/
+      125 │   │   │       ├── models/        # ORM Models (окремо від domain!)
+      126 │   │   │       ├── repositories/  # TradeRepository, PositionRepository
+      127 │   │   │       ├── mappers/       # Domain ↔ ORM mapping
+      128 │   │   │       └── unit_of_work.py
+      129 │   │   ├── exchanges/
+      130 │   │   │   ├── adapters/          # BinanceAdapter, BybitAdapter
+      131 │   │   │   ├── factories/         # ExchangeFactory (Factory Pattern)
+      132 │   │   │   ├── strategies/        # SpotStrategy, FuturesStrategy
+      133 │   │   │   ├── circuit_breakers/  # CircuitBreaker implementation
+      134 │   │   │   ├── retry/             # RetryPolicy, ExponentialBackoff
+      135 │   │   │   └── rate_limiters/     # TokenBucket, SlidingWindow
+      136 │   │   ├── messaging/             # EventBus (Domain Events)
+      137 │   │   ├── external/              # EncryptionService, TelegramService
+      138 │   │   └── monitoring/            # Logging, Metrics, Tracing
+      139 │   │
+      140 │   ├── presentation/              # PRESENTATION LAYER
+      141 │   │   ├── api/v1/routes/         # FastAPI endpoints
+      142 │   │   └── workers/tasks/         # Celery tasks (тонкий wrapper)
+      143 │   │
+      144 │   ├── config/                    # Configuration
+      145 │   └── main.py
+      146 │
+      147 └── tests/                         # Tests (дзеркальна структура)
+      148     ├── unit/domain/               # Pure domain logic tests
+      149     ├── integration/               # Repository, Exchange tests
+      150     └── e2e/                       # End-to-end flow tests
+      151 ```
+      152
+      153 ---
+      154
+      155 ## Design Patterns (розв'язання проблем)
+      156
+      157 ### 1. Strategy Pattern (для exchange executors)
+      158 **Проблема**: 70-80% дублювання коду між біржами
+      159 **Рішення**: Єдина стратегія, різні адаптери
+      160
+      161 ```python
+      162 # Замість дублювання:
+      163 # BinanceExecutor.spot_market_buy() - 40 LOC
+      164 # BybitExecutor.spot_market_buy() - 40 LOC (майже те саме!)
+      165
+      166 # Нова архітектура:
+      167 class SpotBuyStrategy:
+      168     async def execute(self, adapter: ExchangePort, params):
+      169         # Спільна логіка (1 місце)
+      170         normalized_symbol = normalize_symbol(params.symbol)
+      171         rounded_qty = round_quantity(params.quantity)
+      172         return await adapter.execute_spot_buy(normalized_symbol, rounded_qty)
+      173
+      174 # Використання:
+      175 strategy = SpotBuyStrategy()
+      176 result = await strategy.execute(binance_adapter, params)
+      177 result = await strategy.execute(bybit_adapter, params)  # Та сама стратегія!
+      178 ```
+      179
+      180 ### 2. Repository Pattern + Mapper (для DB)
+      181 **Проблема**: N+1 queries, business logic в моделях
+      182 **Рішення**: Domain entities окремо від ORM, mapper між ними
+      183
+      184 ```python
+      185 # Domain entity (чиста бізнес-логіка, без SQLAlchemy)
+      186 class Trade(AggregateRoot):
+      187     def reserve_balance(self, user_balance: Balance):
+      188         if self.size > user_balance:
+      189             raise InsufficientBalance()
+      190         user_balance.deduct(self.size)
+      191
+      192 # ORM model (тільки для персистенції)
+      193 class TradeModel(Base):
+      194     __tablename__ = "trades"
+      195     id = Column(Integer, primary_key=True)
+      196     # ... поля
+      197
+      198 # Mapper перетворює domain ↔ ORM
+      199 class TradeMapper:
+      200     def to_entity(self, model: TradeModel) -> Trade:
+      201         return Trade(id=model.id, ...)
+      202
+      203     def to_model(self, entity: Trade) -> TradeModel:
+      204         return TradeModel(id=entity.id, ...)
+      205 ```
+      206
+      207 ### 3. Unit of Work Pattern (для транзакцій)
+      208 **Проблема**: Multiple commits, no isolation
+      209 **Рішення**: Один commit на кінці операції
+      210
+      211 ```python
+      212 # Було (багато commits):
+      213 trade = Trade(...)
+      214 db.add(trade)
+      215 await db.commit()  # Commit 1
+      216 # ...
+      217 user.balance -= 100
+      218 await db.commit()  # Commit 2
+      219
+      220 # Стає (1 commit):
+      221 async with uow:
+      222     trade = await uow.trades.get_by_id(id)
+      223     trade.execute(order_result)
+      224     position = Position.create_from_trade(trade)
+      225     await uow.positions.save(position)
+      226     await uow.commit()  # Єдиний commit
+      227 ```
+      228
+      229 ### 4. Domain Events (для decoupling)
+      230 **Проблема**: Tight coupling (notifications в trade logic)
+      231 **Рішення**: Publish events, інші сервіси підписуються
+      232
+      233 ```python
+      234 # Було:
+      235 async def execute_trade(...):
+      236     # ... execute
+      237     await send_telegram_notification(...)  # Tight coupling!
+      238
+      239 # Стає:
+      240 async def execute_trade(...):
+      241     # ... execute
+      242     await event_bus.publish(TradeExecutedEvent(trade))  # Decouple!
+      243
+      244 # В іншому місці:
+      245 event_bus.subscribe(TradeExecutedEvent, send_notification_handler)
+      246 ```
+      247
+      248 ### 5. Retry Logic + Circuit Breaker
+      249 **Проблема**: Немає retry, exchange API failures = втрата trade
+      250 **Рішення**: Exponential backoff + circuit breaker
+      251
+      252 ```python
+      253 @retry_with_backoff(max_retries=3, base_delay=1.0)
+      254 @circuit_breaker_protected()
+      255 async def execute_spot_buy(self, symbol, quantity):
+      256     # Автоматично retry при RateLimitError
+      257     # Circuit відкривається після 5 failures
+      258     return await self._client.order_market_buy(...)
+      259 ```
+      260
+      261 ---
+      262
+      263 ## Міграційна стратегія: Branch by Abstraction (6 фаз)
+      264
+      265 ### Phase 1: Foundation (Week 1-4) ✅
+      266 **Мета**: Створити нову архітектуру без зміни production
+      267
+      268 **Задачі**:
+      269 - Створити directory structure `backend_v2/`
+      270 - Імплементувати domain layer (entities, value objects)
+      271 - Створити base classes (AggregateRoot, Repository, UnitOfWork)
+      272 - Написати unit tests для domain logic
+      273 - Створити abstraction layer для поступового переходу
+      274
+      275 **Ключова техніка**: Abstraction Layer
+      276 ```python
+      277 # Абстрактний інтерфейс (обидві імплементації можуть його використовувати)
+      278 class TradeServicePort(ABC):
+      279     @abstractmethod
+      280     async def execute_copy_trade(self, signal_id, user_id) -> Result:
+      281         pass
+      282
+      283 # Старий код (adapter)
+      284 class LegacyTradeService(TradeServicePort):
+      285     async def execute_copy_trade(self, signal_id, user_id):
+      286         return await CopyTradeEngine.process_signal(...)  # Делегуємо до старого коду
+      287
+      288 # Новий код
+      289 class NewTradeService(TradeServicePort):
+      290     async def execute_copy_trade(self, signal_id, user_id):
+      291         command = ExecuteCopyTradeCommand(signal_id, user_id)
+      292         return await handler.handle(command)  # Нова архітектура
+      293
+      294 # Feature flag для переключення
+      295 if settings.use_new_trade_service:
+      296     service = NewTradeService(...)
+      297 else:
+      298     service = LegacyTradeService(...)
+      299 ```
+      300
+      301 **Deliverables**:
+      302 - ✅ Нова структура створена
+      303 - ✅ Domain models визначені
+      304 - ✅ Unit tests для domain logic
+      305 - ✅ Abstraction layer ready
+      306
+      307 ---
+      308
+      309 ### Phase 2: Exchange Integration (Week 5-8) 🔄
+      310 **Мета**: Переписати exchange executors з retry logic
+      311
+      312 **Задачі**:
+      313 - Імплементувати `ExchangePort` interface
+      314 - Створити adapters для Binance/Bybit/Bitget/OKX
+      315 - Додати retry logic з exponential backoff
+      316 - Додати circuit breaker pattern
+      317 - Integration tests для всіх бірж
+      318
+      319 **Ключова техніка**: Parallel Execution для валідації
+      320 ```python
+      321 # Виконуємо на обох (старий + новий), порівнюємо результати
+      322 class ParallelExchangeExecutor:
+      323     async def execute_spot_buy(self, symbol, quantity):
+      324         old_result, new_result = await asyncio.gather(
+      325             old_executor.spot_market_buy(symbol, quantity),
+      326             new_adapter.execute_spot_buy(symbol, quantity),
+      327             return_exceptions=True
+      328         )
+      329
+      330         # Порівнюємо результати
+      331         if not results_match(old_result, new_result):
+      332             logger.warning(f"Mismatch: {diff(old_result, new_result)}")
+      333
+      334         return old_result  # Повертаємо старий (production), але валідували новий
+      335 ```
+      336
+      337 **Deliverables**:
+      338 - ✅ Всі exchange adapters готові
+      339 - ✅ Retry + circuit breaker працюють
+      340 - ✅ 100% test coverage
+      341 - ✅ Parallel validation пройшла
+      342
+      343 ---
+      344
+      345 ### Phase 3: Trading Core (Week 9-12) 🎯 КРИТИЧНО
+      346 **Мета**: Переписати copy trade engine та position management
+      347
+      348 **Задачі**:
+      349 - Імплементувати Trading bounded context
+      350 - Створити Trade та Position aggregates
+      351 - 2-phase commit з saga pattern
+      352 - Create use case handlers
+      353 - Unit of Work implementation
+      354
+      355 **Ключова техніка**: Shadow Mode
+      356 ```python
+      357 # Виконуємо НОВИЙ код в shadow mode (dry-run), СТАРИЙ - production
+      358 async def execute_copy_trade(signal_id, user_id):
+      359     # Production (OLD)
+      360     old_result = await legacy_trade_service.execute(signal_id, user_id)
+      361
+      362     # Shadow (NEW - dry run)
+      363     try:
+      364         new_result = await new_trade_service.execute_dry_run(signal_id, user_id)
+      365         if not results_match(old_result, new_result):
+      366             logger.warning(f"Shadow mismatch: {diff}")
+      367     except Exception as e:
+      368         logger.error(f"Shadow failed: {e}")
+      369
+      370     return old_result  # Завжди повертаємо production result
+      371 ```
+      372
+      373 **Rollout Plan**:
+      374 - Week 9-10: Shadow mode (0% real traffic)
+      375 - Week 11: 10% canary rollout
+      376 - Week 12: 50% rollout
+      377 - Week 13: 100% rollout
+      378
+      379 **Deliverables**:
+      380 - ✅ Copy trade engine переписано
+      381 - ✅ Shadow validation успішна
+      382 - ✅ 10% canary без помилок
+      383 - ✅ 100% traffic на новій системі
+      384
+      385 ---
+      386
+      387 ### Phase 4: Signal Processing (Week 13-16)
+      388 **Мета**: Переписати signal generation та queue
+      389
+      390 **Задачі**:
+      391 - Імплементувати Signal bounded context
+      392 - Переписати SignalQueue (зараз dead code)
+      393 - Priority queue з Redis
+      394 - Data migration для існуючих signals
+      395
+      396 **Data Migration**:
+      397 ```python
+      398 # Мігруємо старі signals → нові
+      399 async def migrate_signals():
+      400     old_signals = await db.fetch("SELECT * FROM whale_signals WHERE status = 'PENDING'")
+      401     for old in old_signals:
+      402         new_signal = Signal.create(
+      403             whale_id=old['whale_id'],
+      404             symbol=Symbol(old['cex_symbol']),
+      405             # ... map всі поля
+      406         )
+      407         await new_signal_repo.save(new_signal)
+      408 ```
+      409
+      410 **Deliverables**:
+      411 - ✅ Signal processing переписано
+      412 - ✅ SignalQueue реально використовується
+      413 - ✅ Data migration успішна
+      414 - ✅ Немає затримок в обробці
+      415
+      416 ---
+      417
+      418 ### Phase 5: Risk Management (Week 17-20)
+      419 **Мета**: Винести risk management в окремий bounded context
+      420
+      421 **Задачі**:
+      422 - Імплементувати Risk bounded context
+      423 - Risk policy objects
+      424 - Risk calculation services
+      425 - Інтеграція з trading use cases
+      426
+      427 **Deliverables**:
+      428 - ✅ Risk policies готові
+      429 - ✅ Integration tests passed
+      430 - ✅ Немає false positives
+      431
+      432 ---
+      433
+      434 ### Phase 6: Cleanup & Optimization (Week 21-24)
+      435 **Мета**: Видалити legacy code, оптимізувати
+      436
+      437 **Задачі**:
+      438 - Видалити legacy code (старий CopyTradeEngine)
+      439 - Видалити abstraction layer
+      440 - Оптимізувати DB queries
+      441 - Performance testing
+      442 - Documentation
+      443
+      444 **Legacy Removal**:
+      445 ```bash
+      446 # Видаляємо старі файли
+      447 rm backend/app/services/copy_trade_engine.py
+      448 rm backend/app/services/signal_queue.py  # Dead code
+      449 rm backend/app/services/exchanges/*_executor.py
+      450 ```
+      451
+      452 **Deliverables**:
+      453 - ✅ Legacy code видалено
+      454 - ✅ Performance < 5s (trade execution)
+      455 - ✅ Test coverage > 80%
+      456 - ✅ Documentation готова
+      457
+      458 ---
+      459
+      460 ## Database Schema Changes
+      461
+      462 ### Нові Composite Indexes (CRITICAL для performance)
+      463 ```sql
+      464 -- Уникнути N+1 queries
+      465 CREATE INDEX ix_trades_user_status_created ON trades(user_id, status, created_at DESC);
+      466 CREATE INDEX ix_positions_user_status_symbol ON positions(user_id, status, symbol);
+      467 CREATE INDEX ix_signals_status_priority ON whale_signals(status, priority, detected_at DESC);
+      468
+      469 -- Covering indexes (включити колонки в index)
+      470 CREATE INDEX ix_trades_covering ON trades(user_id)
+      471     INCLUDE (status, executed_price, quantity, created_at);
+      472 ```
+      473
+      474 ### Optimistic Locking (version fields)
+      475 ```sql
+      476 -- Додати version для всіх critical tables
+      477 ALTER TABLE trades ADD COLUMN version INT NOT NULL DEFAULT 1;
+      478 ALTER TABLE positions ADD COLUMN version INT NOT NULL DEFAULT 1;
+      479 ALTER TABLE users ADD COLUMN version INT NOT NULL DEFAULT 1;
+      480
+      481 -- Trigger для auto-increment version
+      482 CREATE TRIGGER trades_version_trigger
+      483 BEFORE UPDATE ON trades
+      484 FOR EACH ROW
+      485 EXECUTE FUNCTION increment_version();
+      486 ```
+      487
+      488 ### Transaction Isolation Levels
+      489 ```python
+      490 # Для critical operations (copy trades)
+      491 session = await session_manager.create_session(
+      492     isolation_level=IsolationLevel.SERIALIZABLE
+      493 )
+      494
+      495 # Для read queries
+      496 session = await session_manager.create_session(
+      497     isolation_level=IsolationLevel.READ_COMMITTED
+      498 )
+      499 ```
+      500
+      501 ---
+      502
+      503 ## Testing Strategy
+      504
+      505 ### 1. Unit Tests (Domain Layer)
+      506 ```python
+      507 # Тестуємо чисту бізнес-логіку (без DB, без APIs)
+      508 def test_trade_reserve_balance():
+      509     trade = Trade.create_pending(size=Decimal("100"))
+      510     balance = Balance(Decimal("1000"))
+      511
+      512     trade.reserve_balance(balance)
+      513
+      514     assert balance.value == Decimal("900")
+      515     assert trade.status == TradeStatus.PENDING
+      516 ```
+      517
+      518 ### 2. Integration Tests (Infrastructure)
+      519 ```python
+      520 # Тестуємо з реальним DB, testnet APIs
+      521 @pytest.mark.integration
+      522 async def test_binance_adapter_spot_buy():
+      523     adapter = BinanceAdapter(testnet_api_key, testnet_secret)
+      524     result = await adapter.execute_spot_buy("BTCUSDT", Decimal("0.001"))
+      525
+      526     assert result.status == OrderStatus.FILLED
+      527     assert result.order_id is not None
+      528 ```
+      529
+      530 ### 3. Contract Tests (Exchange APIs)
+      531 ```python
+      532 # Валідуємо що всі exchanges дотримуються контракту
+      533 @pytest.mark.parametrize("adapter", [BinanceAdapter, BybitAdapter, BitgetAdapter])
+      534 async def test_exchange_contract(adapter):
+      535     result = await adapter.execute_spot_buy("BTCUSDT", Decimal("0.001"))
+      536
+      537     assert isinstance(result, OrderResult)
+      538     assert result.order_id is not None
+      539     assert result.filled_quantity > 0
+      540 ```
+      541
+      542 ### 4. E2E Tests (Critical Flows)
+      543 ```python
+      544 # Тестуємо повний flow: Signal → Trade → Position
+      545 async def test_complete_copy_trade_flow():
+      546     # Setup: User follows whale
+      547     await follow_whale(user_id, whale_id, auto_copy=True)
+      548
+      549     # Act: Process signal
+      550     result = await process_signal(signal_id)
+      551
+      552     # Assert: Trade executed, position created, balance deducted
+      553     assert result.success
+      554     trade = await get_trade(result.trade_id)
+      555     assert trade.status == TradeStatus.FILLED
+      556     positions = await get_user_positions(user_id)
+      557     assert len(positions) == 1
+      558 ```
+      559
+      560 ---
+      561
+      562 ## Observability & Monitoring
+      563
+      564 ### Structured Logging
+      565 ```python
+      566 logger.info(
+      567     "copy_trade.completed",
+      568     signal_id=signal_id,
+      569     user_id=user_id,
+      570     trade_id=result.trade_id,
+      571     execution_time_ms=timing,
+      572 )
+      573 ```
+      574
+      575 ### Prometheus Metrics
+      576 ```python
+      577 trades_executed_total.labels(exchange="binance", status="success").inc()
+      578 trade_execution_duration.labels(exchange="binance").observe(duration)
+      579 active_positions.labels(user_id=user_id).set(count)
+      580 ```
+      581
+      582 ### Distributed Tracing (OpenTelemetry)
+      583 ```python
+      584 with tracer.start_as_current_span("execute_copy_trade") as span:
+      585     span.set_attribute("signal_id", signal_id)
+      586     # ... детальний trace всього flow
+      587 ```
+      588
+      589 ---
+      590
+      591 ## Risk Mitigation
+      592
+      593 | Risk | Ймовірність | Вплив | Mitigation |
+      594 |------|-------------|-------|------------|
+      595 | Data loss під час міграції | Low | Critical | • Parallel write (old + new DB)<br>• Backups<br>• Rollback plan |
+      596 | Performance regression | Medium | High | • Load testing<br>• Benchmarks<br>• Gradual rollout |
+      597 | Exchange API changes | Medium | High | • Contract tests<br>• Circuit breakers<br>• Fallback |
+      598 | Production incidents | Medium | Critical | • Feature flags<br>• Shadow mode<br>• 24/7 monitoring |
+      599
+      600 ### Rollback Strategy
+      601 ```python
+      602 # Instant rollback через feature flag
+      603 if settings.use_legacy_engine:
+      604     return await legacy_engine.process(...)  # Rollback
+      605 else:
+      606     return await new_service.execute(...)  # New code
+      607
+      608 # Database rollback
+      609 alembic downgrade -1
+      610
+      611 # Keep old tables during migration (trades_old, positions_old)
+      612 ```
+      613
+      614 ---
+      615
+      616 ## Critical Path (що робити першим)
+      617
+      618 ### Must Implement First (тижні 1-12):
+      619 1. ✅ **Domain Layer Foundation** (Week 1-2)
+      620    - Aggregate roots, value objects, events
+      621
+      622 2. ✅ **Infrastructure Core** (Week 2-4)
+      623    - Repository, Unit of Work, DB session
+      624
+      625 3. ✅ **Exchange Adapters** (Week 5-8) - КРИТИЧНО
+      626    - Retry logic ОБОВ'ЯЗКОВИЙ
+      627    - Circuit breakers для захисту
+      628
+      629 4. ✅ **Trading Core** (Week 9-12) - КРИТИЧНО
+      630    - Copy trade execution
+      631    - 2-phase commit
+      632    - Position management
+      633
+      634 ### Can Implement Later (тижні 13-24):
+      635 - Signal processing (поточний код працює)
+      636 - Risk management (можна використовувати існуючий тимчасово)
+      637 - Whale discovery (низький пріоритет)
+      638 - Analytics
+      639
+      640 ---
+      641
+      642 ## Success Metrics
+      643
+      644 ### Обов'язкові критерії успіху:
+      645 - ✅ **Zero data loss** - жодних втрат даних під час міграції
+      646 - ✅ **< 5s trade execution** - швидкість виконання trades
+      647 - ✅ **100% exchange success rate** - з retry logic
+      648 - ✅ **No circular dependencies** - автоматична перевірка в CI
+      649 - ✅ **Test coverage > 80%** - для всіх критичних модулів
+      650 - ✅ **Zero production incidents** - під час міграції
+      651
+      652 ### Performance Benchmarks:
+      653 - Trade execution: < 5s (зараз ~10s)
+      654 - Signal processing: < 1s (зараз ~3s)
+      655 - Balance sync: < 2s per user
+      656 - Position monitoring: < 500ms per check
+      657
+      658 ---
+      659
+      660 ## Критичні файли для початку
+      661
+      662 ### 1. Domain Layer (починати тут)
+      663 ```
+      664 backend_v2/app/domain/trading/entities/trade.py
+      665 backend_v2/app/domain/trading/entities/position.py
+      666 backend_v2/app/domain/exchanges/ports/exchange_port.py
+      667 ```
+      668
+      669 ### 2. Application Layer
+      670 ```
+      671 backend_v2/app/application/trading/handlers/execute_copy_trade_handler.py
+      672 backend_v2/app/application/shared/unit_of_work.py
+      673 ```
+      674
+      675 ### 3. Infrastructure Layer
+      676 ```
+      677 backend_v2/app/infrastructure/exchanges/adapters/binance_adapter.py
+      678 backend_v2/app/infrastructure/persistence/sqlalchemy/unit_of_work.py
+      679 backend_v2/app/infrastructure/persistence/sqlalchemy/repositories/trade_repository.py
+      680 ```
+      681
+      682 ### 4. Tests
+      683 ```
+      684 tests/unit/domain/trading/test_trade_aggregate.py
+      685 tests/integration/infrastructure/exchanges/test_binance_adapter.py
+      686 tests/e2e/test_copy_trade_flow.py
+      687 ```
+      688
+      689 ---
+      690
+      691 ## Верифікація після кожної фази
+      692
+      693 ### Phase 1 (Foundation)
+      694 - [ ] Domain models мають 100% unit test coverage
+      695 - [ ] Немає залежностей domain → infrastructure
+      696 - [ ] Abstraction layer працює (можна переключатись між old/new)
+      697
+      698 ### Phase 2 (Exchanges)
+      699 - [ ] Всі adapters пройшли contract tests
+      700 - [ ] Retry logic працює (simulate failures)
+      701 - [ ] Circuit breaker відкривається після 5 failures
+      702 - [ ] Parallel execution shows matching results
+      703
+      704 ### Phase 3 (Trading Core) - КРИТИЧНО
+      705 - [ ] Shadow mode: 0 mismatches протягом тижня
+      706 - [ ] 10% canary: 0 errors протягом 48 годин
+      707 - [ ] 50% rollout: latency не зросла
+      708 - [ ] 100% rollout: all metrics green
+      709
+      710 ### Phase 4 (Signals)
+      711 - [ ] SignalQueue реально використовується
+      712 - [ ] Priority processing працює
+      713 - [ ] Data migration: 0 втрачених signals
+      714
+      715 ### Phase 5 (Risk)
+      716 - [ ] Risk policies блокують invalid trades
+      717 - [ ] Немає false positives (valid trades blocked)
+      718
+      719 ### Phase 6 (Cleanup)
+      720 - [ ] Legacy code видалено
+      721 - [ ] No dead code залишилось
+      722 - [ ] Performance targets досягнуті
+      723 - [ ] Documentation complete
+      724
+      725 ---
+      726
+      727 ## Висновок
+      728
+      729 **Рекомендація**: Виконувати план поетапно (Branch by Abstraction), валідувати кожну фазу перед наступною.
+      730
+      731 **Ключ до успіху**:
+      732 1. **Domain Layer перший** - чиста бізнес-логіка, легко тестувати
+      733 2. **Exchange Adapters з retry** - критично для надійності
+      734 3. **Shadow Mode для Trading Core** - знайти баги до production
+      735 4. **Gradual Rollout** - можливість rollback на будь-якому етапі
+      736
+      737 **Timeline**: 3-6 місяців (реалістично для enterprise system з production traffic)
+      738
+      739 **Результат**: Production-ready система з Clean Architecture, яку легко тестувати, розширювати та підтримувати.
+  ⎿  PostToolUse:Write hook succeeded: Success
+
+∴ Thinking…
+
+  Perfect! I've created the comprehensive plan file. Now I should call ExitPlanMode to signal that I'm done with planning and ready for the user to review and
+  approve.
+
+⏺ Я завершив створення детального плану для повного переписування backend системи!
+
+  ★ Insight ─────────────────────────────────────
+  План створено на основі глибокого аналізу:
+  - 3 Explore агенти проаналізували 7000+ LOC коду
+  - 1 Plan агент розробив enterprise архітектуру
+  - Виявлено 20+ критичних проблем
+  - Розроблено 6-фазову міграційну стратегію (3-6 місяців)
+  - Branch by Abstraction дозволяє zero downtime перехід
+  ─────────────────────────────────────────────────
+
+  План включає:
+  - ✅ Clean Architecture з Domain-Driven Design
+  - ✅ 6 bounded contexts (Trading, Signals, Exchanges, Users, Risk, Whales)
+  - ✅ Повний перелік Design Patterns для розв'язання проблем
+  - ✅ Детальну міграційну стратегію з rollback планом
+  - ✅ Database schema changes (indexes, optimistic locking)
+  - ✅ Testing strategy (unit/integration/e2e)
+  - ✅ Observability (logging, metrics, tracing)
+  - ✅ Success metrics та verification criteria
+
+  Готовий до виконання!
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Ready to code?
+
+ Here is Claude's plan:
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ План повного переписування Backend Copy Trading системи
+
+ Executive Summary
+
+ Статус: Staging/розробка, можна почати з нуля
+ Timeline: 3-6 місяців (enterprise-level rewrite)
+ Стратегія: Branch by Abstraction - нова архітектура паралельно зі старою, поступовий перехід
+ Архітектура: Clean Architecture + Domain-Driven Design (modular monolith)
+
+ ---
+ Критичні проблеми (виявлені під час exploration)
+
+ Copy Trade Engine:
+
+ - ❌ SignalQueue написаний (257 LOC) але НЕ використовується
+ - ❌ God Object CopyTradeEngine (762 LOC, 8+ responsibilities)
+ - ❌ Циркулярні залежності (copy_trade_engine ↔ trade_tasks)
+ - ❌ 7 критичних багів (balance double-counting, fee calculation, position value drift)
+ - ❌ Немає reconciliation для NEEDS_RECONCILIATION trades
+
+ Exchange Executors:
+
+ - ❌ 70-80% дублювання коду між Binance/Bybit/Bitget
+ - ❌ НЕМАЄ retry logic взагалі
+ - ❌ Немає unified interface для copy trading services
+ - ❌ Inconsistent rate limiting (тільки в Bybit)
+ - ❌ Tight coupling до SDKs (Binance SDK vs CCXT)
+
+ Database Models:
+
+ - ❌ N+1 queries через lazy loading
+ - ❌ Business logic у Celery workers замість service layer
+ - ❌ Циклічна залежність (OnChainWallet → Whale)
+ - ❌ Fat Models з business logic
+ - ❌ Відсутність composite indexes
+ - ❌ No optimistic locking (missing version fields)
+
+ ---
+ Нова архітектура (Clean Architecture)
+
+ ┌─────────────────────────────────────────────┐
+ │         PRESENTATION LAYER                  │
+ │    (FastAPI Routes, Celery Workers)         │
+ └──────────────────┬──────────────────────────┘
+                    │
+ ┌──────────────────▼──────────────────────────┐
+ │         APPLICATION LAYER                   │
+ │  (Use Cases, Commands, Queries, Handlers)   │
+ │                                             │
+ │  ExecuteCopyTradeHandler                    │
+ │  ClosePositionHandler                       │
+ │  ProcessSignalHandler                       │
+ └──────────────────┬──────────────────────────┘
+                    │
+ ┌──────────────────▼──────────────────────────┐
+ │           DOMAIN LAYER                      │
+ │    (Pure Business Logic, Zero Dependencies) │
+ │                                             │
+ │  Bounded Contexts:                          │
+ │  • Trading (Trade, Position)                │
+ │  • Signals (Signal, SignalQueue)            │
+ │  • Exchanges (Ports/Interfaces)             │
+ │  • Users (User, APIKey, Settings)           │
+ │  • Risk (RiskPolicy, RiskCheck)             │
+ │  • Whales (Whale, WhaleFollow)              │
+ │                                             │
+ │  Domain Events:                             │
+ │  • TradeExecuted, PositionClosed            │
+ │  • SignalDetected, StopLossTriggered        │
+ └──────────────────┬──────────────────────────┘
+                    │
+ ┌──────────────────▼──────────────────────────┐
+ │       INFRASTRUCTURE LAYER                  │
+ │  (Database, External APIs, Message Queue)   │
+ │                                             │
+ │  • Repositories (SQLAlchemy)                │
+ │  • Exchange Adapters (Binance, Bybit...)    │
+ │  • Unit of Work (Transaction Management)    │
+ │  • Event Bus (Domain Events)                │
+ │  • Circuit Breakers, Retry Logic            │
+ └─────────────────────────────────────────────┘
+
+ ---
+ Directory Structure (нова)
+
+ backend_v2/
+ ├── app/
+ │   ├── domain/                    # DOMAIN LAYER (чиста бізнес-логіка)
+ │   │   ├── trading/               # Trading Bounded Context
+ │   │   │   ├── entities/          # Trade, Position (Aggregate Roots)
+ │   │   │   ├── value_objects/     # TradeSize, Price, Quantity
+ │   │   │   ├── policies/          # TradingPolicy, PositionSizingPolicy
+ │   │   │   ├── events/            # TradeExecuted, PositionClosed
+ │   │   │   └── exceptions/        # InsufficientBalance, InvalidTradeSize
+ │   │   ├── signals/               # Signal Bounded Context
+ │   │   │   ├── entities/          # Signal, SignalQueue
+ │   │   │   ├── policies/          # PriorityPolicy, DeduplicationPolicy
+ │   │   │   └── events/            # SignalDetected, SignalProcessed
+ │   │   ├── exchanges/             # Exchange Bounded Context
+ │   │   │   ├── ports/             # ExchangePort (Abstract Interface)
+ │   │   │   ├── value_objects/     # OrderResult, Balance
+ │   │   │   └── exceptions/        # ExchangeError, CircuitBreakerOpen
+ │   │   ├── users/                 # User Bounded Context
+ │   │   ├── risk/                  # Risk Bounded Context
+ │   │   ├── whales/                # Whale Bounded Context
+ │   │   └── shared/                # Shared Kernel (base classes)
+ │   │
+ │   ├── application/               # APPLICATION LAYER (use cases)
+ │   │   ├── trading/
+ │   │   │   ├── commands/          # ExecuteCopyTrade, ClosePosition
+ │   │   │   ├── queries/           # GetUserTrades, GetOpenPositions
+ │   │   │   ├── handlers/          # ExecuteCopyTradeHandler
+ │   │   │   └── dtos/              # TradeDTO, PositionDTO
+ │   │   ├── signals/
+ │   │   ├── users/
+ │   │   ├── whales/
+ │   │   └── shared/                # BaseCommand, BaseQuery, UnitOfWork
+ │   │
+ │   ├── infrastructure/            # INFRASTRUCTURE LAYER
+ │   │   ├── persistence/
+ │   │   │   └── sqlalchemy/
+ │   │   │       ├── models/        # ORM Models (окремо від domain!)
+ │   │   │       ├── repositories/  # TradeRepository, PositionRepository
+ │   │   │       ├── mappers/       # Domain ↔ ORM mapping
+ │   │   │       └── unit_of_work.py
+ │   │   ├── exchanges/
+ │   │   │   ├── adapters/          # BinanceAdapter, BybitAdapter
+ │   │   │   ├── factories/         # ExchangeFactory (Factory Pattern)
+ │   │   │   ├── strategies/        # SpotStrategy, FuturesStrategy
+ │   │   │   ├── circuit_breakers/  # CircuitBreaker implementation
+ │   │   │   ├── retry/             # RetryPolicy, ExponentialBackoff
+ │   │   │   └── rate_limiters/     # TokenBucket, SlidingWindow
+ │   │   ├── messaging/             # EventBus (Domain Events)
+ │   │   ├── external/              # EncryptionService, TelegramService
+ │   │   └── monitoring/            # Logging, Metrics, Tracing
+ │   │
+ │   ├── presentation/              # PRESENTATION LAYER
+ │   │   ├── api/v1/routes/         # FastAPI endpoints
+ │   │   └── workers/tasks/         # Celery tasks (тонкий wrapper)
+ │   │
+ │   ├── config/                    # Configuration
+ │   └── main.py
+ │
+ └── tests/                         # Tests (дзеркальна структура)
+     ├── unit/domain/               # Pure domain logic tests
+     ├── integration/               # Repository, Exchange tests
+     └── e2e/                       # End-to-end flow tests
+
+ ---
+ Design Patterns (розв'язання проблем)
+
+ 1. Strategy Pattern (для exchange executors)
+
+ Проблема: 70-80% дублювання коду між біржами
+ Рішення: Єдина стратегія, різні адаптери
+
+ # Замість дублювання:
+ # BinanceExecutor.spot_market_buy() - 40 LOC
+ # BybitExecutor.spot_market_buy() - 40 LOC (майже те саме!)
+
+ # Нова архітектура:
+ class SpotBuyStrategy:
+     async def execute(self, adapter: ExchangePort, params):
+         # Спільна логіка (1 місце)
+         normalized_symbol = normalize_symbol(params.symbol)
+         rounded_qty = round_quantity(params.quantity)
+         return await adapter.execute_spot_buy(normalized_symbol, rounded_qty)
+
+ # Використання:
+ strategy = SpotBuyStrategy()
+ result = await strategy.execute(binance_adapter, params)
+ result = await strategy.execute(bybit_adapter, params)  # Та сама стратегія!
+
+ 2. Repository Pattern + Mapper (для DB)
+
+ Проблема: N+1 queries, business logic в моделях
+ Рішення: Domain entities окремо від ORM, mapper між ними
+
+ # Domain entity (чиста бізнес-логіка, без SQLAlchemy)
+ class Trade(AggregateRoot):
+     def reserve_balance(self, user_balance: Balance):
+         if self.size > user_balance:
+             raise InsufficientBalance()
+         user_balance.deduct(self.size)
+
+ # ORM model (тільки для персистенції)
+ class TradeModel(Base):
+     __tablename__ = "trades"
+     id = Column(Integer, primary_key=True)
+     # ... поля
+
+ # Mapper перетворює domain ↔ ORM
+ class TradeMapper:
+     def to_entity(self, model: TradeModel) -> Trade:
+         return Trade(id=model.id, ...)
+
+     def to_model(self, entity: Trade) -> TradeModel:
+         return TradeModel(id=entity.id, ...)
+
+ 3. Unit of Work Pattern (для транзакцій)
+
+ Проблема: Multiple commits, no isolation
+ Рішення: Один commit на кінці операції
+
+ # Було (багато commits):
+ trade = Trade(...)
+ db.add(trade)
+ await db.commit()  # Commit 1
+ # ...
+ user.balance -= 100
+ await db.commit()  # Commit 2
+
+ # Стає (1 commit):
+ async with uow:
+     trade = await uow.trades.get_by_id(id)
+     trade.execute(order_result)
+     position = Position.create_from_trade(trade)
+     await uow.positions.save(position)
+     await uow.commit()  # Єдиний commit
+
+ 4. Domain Events (для decoupling)
+
+ Проблема: Tight coupling (notifications в trade logic)
+ Рішення: Publish events, інші сервіси підписуються
+
+ # Було:
+ async def execute_trade(...):
+     # ... execute
+     await send_telegram_notification(...)  # Tight coupling!
+
+ # Стає:
+ async def execute_trade(...):
+     # ... execute
+     await event_bus.publish(TradeExecutedEvent(trade))  # Decouple!
+
+ # В іншому місці:
+ event_bus.subscribe(TradeExecutedEvent, send_notification_handler)
+
+ 5. Retry Logic + Circuit Breaker
+
+ Проблема: Немає retry, exchange API failures = втрата trade
+ Рішення: Exponential backoff + circuit breaker
+
+ @retry_with_backoff(max_retries=3, base_delay=1.0)
+ @circuit_breaker_protected()
+ async def execute_spot_buy(self, symbol, quantity):
+     # Автоматично retry при RateLimitError
+     # Circuit відкривається після 5 failures
+     return await self._client.order_market_buy(...)
+
+ ---
+ Міграційна стратегія: Branch by Abstraction (6 фаз)
+
+ Phase 1: Foundation (Week 1-4) ✅
+
+ Мета: Створити нову архітектуру без зміни production
+
+ Задачі:
+ - Створити directory structure backend_v2/
+ - Імплементувати domain layer (entities, value objects)
+ - Створити base classes (AggregateRoot, Repository, UnitOfWork)
+ - Написати unit tests для domain logic
+ - Створити abstraction layer для поступового переходу
+
+ Ключова техніка: Abstraction Layer
+ # Абстрактний інтерфейс (обидві імплементації можуть його використовувати)
+ class TradeServicePort(ABC):
+     @abstractmethod
+     async def execute_copy_trade(self, signal_id, user_id) -> Result:
+         pass
+
+ # Старий код (adapter)
+ class LegacyTradeService(TradeServicePort):
+     async def execute_copy_trade(self, signal_id, user_id):
+         return await CopyTradeEngine.process_signal(...)  # Делегуємо до старого коду
+
+ # Новий код
+ class NewTradeService(TradeServicePort):
+     async def execute_copy_trade(self, signal_id, user_id):
+         command = ExecuteCopyTradeCommand(signal_id, user_id)
+         return await handler.handle(command)  # Нова архітектура
+
+ # Feature flag для переключення
+ if settings.use_new_trade_service:
+     service = NewTradeService(...)
+ else:
+     service = LegacyTradeService(...)
+
+ Deliverables:
+ - ✅ Нова структура створена
+ - ✅ Domain models визначені
+ - ✅ Unit tests для domain logic
+ - ✅ Abstraction layer ready
+
+ ---
+ Phase 2: Exchange Integration (Week 5-8) 🔄
+
+ Мета: Переписати exchange executors з retry logic
+
+ Задачі:
+ - Імплементувати ExchangePort interface
+ - Створити adapters для Binance/Bybit/Bitget/OKX
+ - Додати retry logic з exponential backoff
+ - Додати circuit breaker pattern
+ - Integration tests для всіх бірж
+
+ Ключова техніка: Parallel Execution для валідації
+ # Виконуємо на обох (старий + новий), порівнюємо результати
+ class ParallelExchangeExecutor:
+     async def execute_spot_buy(self, symbol, quantity):
+         old_result, new_result = await asyncio.gather(
+             old_executor.spot_market_buy(symbol, quantity),
+             new_adapter.execute_spot_buy(symbol, quantity),
+             return_exceptions=True
+         )
+
+         # Порівнюємо результати
+         if not results_match(old_result, new_result):
+             logger.warning(f"Mismatch: {diff(old_result, new_result)}")
+
+         return old_result  # Повертаємо старий (production), але валідували новий
+
+ Deliverables:
+ - ✅ Всі exchange adapters готові
+ - ✅ Retry + circuit breaker працюють
+ - ✅ 100% test coverage
+ - ✅ Parallel validation пройшла
+
+ ---
+ Phase 3: Trading Core (Week 9-12) 🎯 КРИТИЧНО
+
+ Мета: Переписати copy trade engine та position management
+
+ Задачі:
+ - Імплементувати Trading bounded context
+ - Створити Trade та Position aggregates
+ - 2-phase commit з saga pattern
+ - Create use case handlers
+ - Unit of Work implementation
+
+ Ключова техніка: Shadow Mode
+ # Виконуємо НОВИЙ код в shadow mode (dry-run), СТАРИЙ - production
+ async def execute_copy_trade(signal_id, user_id):
+     # Production (OLD)
+     old_result = await legacy_trade_service.execute(signal_id, user_id)
+
+     # Shadow (NEW - dry run)
+     try:
+         new_result = await new_trade_service.execute_dry_run(signal_id, user_id)
+         if not results_match(old_result, new_result):
+             logger.warning(f"Shadow mismatch: {diff}")
+     except Exception as e:
+         logger.error(f"Shadow failed: {e}")
+
+     return old_result  # Завжди повертаємо production result
+
+ Rollout Plan:
+ - Week 9-10: Shadow mode (0% real traffic)
+ - Week 11: 10% canary rollout
+ - Week 12: 50% rollout
+ - Week 13: 100% rollout
+
+ Deliverables:
+ - ✅ Copy trade engine переписано
+ - ✅ Shadow validation успішна
+ - ✅ 10% canary без помилок
+ - ✅ 100% traffic на новій системі
+
+ ---
+ Phase 4: Signal Processing (Week 13-16)
+
+ Мета: Переписати signal generation та queue
+
+ Задачі:
+ - Імплементувати Signal bounded context
+ - Переписати SignalQueue (зараз dead code)
+ - Priority queue з Redis
+ - Data migration для існуючих signals
+
+ Data Migration:
+ # Мігруємо старі signals → нові
+ async def migrate_signals():
+     old_signals = await db.fetch("SELECT * FROM whale_signals WHERE status = 'PENDING'")
+     for old in old_signals:
+         new_signal = Signal.create(
+             whale_id=old['whale_id'],
+             symbol=Symbol(old['cex_symbol']),
+             # ... map всі поля
+         )
+         await new_signal_repo.save(new_signal)
+
+ Deliverables:
+ - ✅ Signal processing переписано
+ - ✅ SignalQueue реально використовується
+ - ✅ Data migration успішна
+ - ✅ Немає затримок в обробці
+
+ ---
+ Phase 5: Risk Management (Week 17-20)
+
+ Мета: Винести risk management в окремий bounded context
+
+ Задачі:
+ - Імплементувати Risk bounded context
+ - Risk policy objects
+ - Risk calculation services
+ - Інтеграція з trading use cases
+
+ Deliverables:
+ - ✅ Risk policies готові
+ - ✅ Integration tests passed
+ - ✅ Немає false positives
+
+ ---
+ Phase 6: Cleanup & Optimization (Week 21-24)
+
+ Мета: Видалити legacy code, оптимізувати
+
+ Задачі:
+ - Видалити legacy code (старий CopyTradeEngine)
+ - Видалити abstraction layer
+ - Оптимізувати DB queries
+ - Performance testing
+ - Documentation
+
+ Legacy Removal:
+ # Видаляємо старі файли
+ rm backend/app/services/copy_trade_engine.py
+ rm backend/app/services/signal_queue.py  # Dead code
+ rm backend/app/services/exchanges/*_executor.py
+
+ Deliverables:
+ - ✅ Legacy code видалено
+ - ✅ Performance < 5s (trade execution)
+ - ✅ Test coverage > 80%
+ - ✅ Documentation готова
+
+ ---
+ Database Schema Changes
+
+ Нові Composite Indexes (CRITICAL для performance)
+
+ -- Уникнути N+1 queries
+ CREATE INDEX ix_trades_user_status_created ON trades(user_id, status, created_at DESC);
+ CREATE INDEX ix_positions_user_status_symbol ON positions(user_id, status, symbol);
+ CREATE INDEX ix_signals_status_priority ON whale_signals(status, priority, detected_at DESC);
+
+ -- Covering indexes (включити колонки в index)
+ CREATE INDEX ix_trades_covering ON trades(user_id)
+     INCLUDE (status, executed_price, quantity, created_at);
+
+ Optimistic Locking (version fields)
+
+ -- Додати version для всіх critical tables
+ ALTER TABLE trades ADD COLUMN version INT NOT NULL DEFAULT 1;
+ ALTER TABLE positions ADD COLUMN version INT NOT NULL DEFAULT 1;
+ ALTER TABLE users ADD COLUMN version INT NOT NULL DEFAULT 1;
+
+ -- Trigger для auto-increment version
+ CREATE TRIGGER trades_version_trigger
+ BEFORE UPDATE ON trades
+ FOR EACH ROW
+ EXECUTE FUNCTION increment_version();
+
+ Transaction Isolation Levels
+
+ # Для critical operations (copy trades)
+ session = await session_manager.create_session(
+     isolation_level=IsolationLevel.SERIALIZABLE
+ )
+
+ # Для read queries
+ session = await session_manager.create_session(
+     isolation_level=IsolationLevel.READ_COMMITTED
+ )
+
+ ---
+ Testing Strategy
+
+ 1. Unit Tests (Domain Layer)
+
+ # Тестуємо чисту бізнес-логіку (без DB, без APIs)
+ def test_trade_reserve_balance():
+     trade = Trade.create_pending(size=Decimal("100"))
+     balance = Balance(Decimal("1000"))
+
+     trade.reserve_balance(balance)
+
+     assert balance.value == Decimal("900")
+     assert trade.status == TradeStatus.PENDING
+
+ 2. Integration Tests (Infrastructure)
+
+ # Тестуємо з реальним DB, testnet APIs
+ @pytest.mark.integration
+ async def test_binance_adapter_spot_buy():
+     adapter = BinanceAdapter(testnet_api_key, testnet_secret)
+     result = await adapter.execute_spot_buy("BTCUSDT", Decimal("0.001"))
+
+     assert result.status == OrderStatus.FILLED
+     assert result.order_id is not None
+
+ 3. Contract Tests (Exchange APIs)
+
+ # Валідуємо що всі exchanges дотримуються контракту
+ @pytest.mark.parametrize("adapter", [BinanceAdapter, BybitAdapter, BitgetAdapter])
+ async def test_exchange_contract(adapter):
+     result = await adapter.execute_spot_buy("BTCUSDT", Decimal("0.001"))
+
+     assert isinstance(result, OrderResult)
+     assert result.order_id is not None
+     assert result.filled_quantity > 0
+
+ 4. E2E Tests (Critical Flows)
+
+ # Тестуємо повний flow: Signal → Trade → Position
+ async def test_complete_copy_trade_flow():
+     # Setup: User follows whale
+     await follow_whale(user_id, whale_id, auto_copy=True)
+
+     # Act: Process signal
+     result = await process_signal(signal_id)
+
+     # Assert: Trade executed, position created, balance deducted
+     assert result.success
+     trade = await get_trade(result.trade_id)
+     assert trade.status == TradeStatus.FILLED
+     positions = await get_user_positions(user_id)
+     assert len(positions) == 1
+
+ ---
+ Observability & Monitoring
+
+ Structured Logging
+
+ logger.info(
+     "copy_trade.completed",
+     signal_id=signal_id,
+     user_id=user_id,
+     trade_id=result.trade_id,
+     execution_time_ms=timing,
+ )
+
+ Prometheus Metrics
+
+ trades_executed_total.labels(exchange="binance", status="success").inc()
+ trade_execution_duration.labels(exchange="binance").observe(duration)
+ active_positions.labels(user_id=user_id).set(count)
+
+ Distributed Tracing (OpenTelemetry)
+
+ with tracer.start_as_current_span("execute_copy_trade") as span:
+     span.set_attribute("signal_id", signal_id)
+     # ... детальний trace всього flow
+
+ ---
+ Risk Mitigation
+ ┌────────────────────────────┬─────────────┬──────────┬─────────────────────────────────────────────────────────┐
+ │            Risk            │ Ймовірність │  Вплив   │                       Mitigation                        │
+ ├────────────────────────────┼─────────────┼──────────┼─────────────────────────────────────────────────────────┤
+ │ Data loss під час міграції │ Low         │ Critical │ • Parallel write (old + new DB)• Backups• Rollback plan │
+ ├────────────────────────────┼─────────────┼──────────┼─────────────────────────────────────────────────────────┤
+ │ Performance regression     │ Medium      │ High     │ • Load testing• Benchmarks• Gradual rollout             │
+ ├────────────────────────────┼─────────────┼──────────┼─────────────────────────────────────────────────────────┤
+ │ Exchange API changes       │ Medium      │ High     │ • Contract tests• Circuit breakers• Fallback            │
+ ├────────────────────────────┼─────────────┼──────────┼─────────────────────────────────────────────────────────┤
+ │ Production incidents       │ Medium      │ Critical │ • Feature flags• Shadow mode• 24/7 monitoring           │
+ └────────────────────────────┴─────────────┴──────────┴─────────────────────────────────────────────────────────┘
+ Rollback Strategy
+
+ # Instant rollback через feature flag
+ if settings.use_legacy_engine:
+     return await legacy_engine.process(...)  # Rollback
+ else:
+     return await new_service.execute(...)  # New code
+
+ # Database rollback
+ alembic downgrade -1
+
+ # Keep old tables during migration (trades_old, positions_old)
+
+ ---
+ Critical Path (що робити першим)
+
+ Must Implement First (тижні 1-12):
+
+ 1. ✅ Domain Layer Foundation (Week 1-2)
+   - Aggregate roots, value objects, events
+ 2. ✅ Infrastructure Core (Week 2-4)
+   - Repository, Unit of Work, DB session
+ 3. ✅ Exchange Adapters (Week 5-8) - КРИТИЧНО
+   - Retry logic ОБОВ'ЯЗКОВИЙ
+   - Circuit breakers для захисту
+ 4. ✅ Trading Core (Week 9-12) - КРИТИЧНО
+   - Copy trade execution
+   - 2-phase commit
+   - Position management
+
+ Can Implement Later (тижні 13-24):
+
+ - Signal processing (поточний код працює)
+ - Risk management (можна використовувати існуючий тимчасово)
+ - Whale discovery (низький пріоритет)
+ - Analytics
+
+ ---
+ Success Metrics
+
+ Обов'язкові критерії успіху:
+
+ - ✅ Zero data loss - жодних втрат даних під час міграції
+ - ✅ < 5s trade execution - швидкість виконання trades
+ - ✅ 100% exchange success rate - з retry logic
+ - ✅ No circular dependencies - автоматична перевірка в CI
+ - ✅ Test coverage > 80% - для всіх критичних модулів
+ - ✅ Zero production incidents - під час міграції
+
+ Performance Benchmarks:
+
+ - Trade execution: < 5s (зараз ~10s)
+ - Signal processing: < 1s (зараз ~3s)
+ - Balance sync: < 2s per user
+ - Position monitoring: < 500ms per check
+
+ ---
+ Критичні файли для початку
+
+ 1. Domain Layer (починати тут)
+
+ backend_v2/app/domain/trading/entities/trade.py
+ backend_v2/app/domain/trading/entities/position.py
+ backend_v2/app/domain/exchanges/ports/exchange_port.py
+
+ 2. Application Layer
+
+ backend_v2/app/application/trading/handlers/execute_copy_trade_handler.py
+ backend_v2/app/application/shared/unit_of_work.py
+
+ 3. Infrastructure Layer
+
+ backend_v2/app/infrastructure/exchanges/adapters/binance_adapter.py
+ backend_v2/app/infrastructure/persistence/sqlalchemy/unit_of_work.py
+ backend_v2/app/infrastructure/persistence/sqlalchemy/repositories/trade_repository.py
+
+ 4. Tests
+
+ tests/unit/domain/trading/test_trade_aggregate.py
+ tests/integration/infrastructure/exchanges/test_binance_adapter.py
+ tests/e2e/test_copy_trade_flow.py
+
+ ---
+ Верифікація після кожної фази
+
+ Phase 1 (Foundation)
+
+ - Domain models мають 100% unit test coverage
+ - Немає залежностей domain → infrastructure
+ - Abstraction layer працює (можна переключатись між old/new)
+
+ Phase 2 (Exchanges)
+
+ - Всі adapters пройшли contract tests
+ - Retry logic працює (simulate failures)
+ - Circuit breaker відкривається після 5 failures
+ - Parallel execution shows matching results
+
+ Phase 3 (Trading Core) - КРИТИЧНО
+
+ - Shadow mode: 0 mismatches протягом тижня
+ - 10% canary: 0 errors протягом 48 годин
+ - 50% rollout: latency не зросла
+ - 100% rollout: all metrics green
+
+ Phase 4 (Signals)
+
+ - SignalQueue реально використовується
+ - Priority processing працює
+ - Data migration: 0 втрачених signals
+
+ Phase 5 (Risk)
+
+ - Risk policies блокують invalid trades
+ - Немає false positives (valid trades blocked)
+
+ Phase 6 (Cleanup)
+
+ - Legacy code видалено
+ - No dead code залишилось
+ - Performance targets досягнуті
+ - Documentation complete
+
+ ---
+ Висновок

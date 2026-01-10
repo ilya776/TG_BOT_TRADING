@@ -56,7 +56,7 @@ class Whale(Base):
     # Identification
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     wallet_address: Mapped[str] = mapped_column(
-        String(42), unique=True, nullable=False, index=True
+        String(100), unique=True, nullable=False, index=True
     )
     chain: Mapped[WhaleChain] = mapped_column(
         SQLEnum(WhaleChain), default=WhaleChain.ETHEREUM
@@ -98,6 +98,27 @@ class Whale(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
+
+    # CEX Trader fields (for exchange-based tracking)
+    whale_type: Mapped[str | None] = mapped_column(
+        String(20), default="CEX_TRADER"
+    )  # CEX_TRADER, ON_CHAIN
+    exchange: Mapped[str | None] = mapped_column(String(20))  # BINANCE, OKX, BITGET
+    exchange_uid: Mapped[str | None] = mapped_column(String(100))  # Trader UID on exchange
+
+    # Data status and polling
+    data_status: Mapped[str | None] = mapped_column(
+        String(30), default="ACTIVE"
+    )  # ACTIVE, SHARING_DISABLED, ERROR
+    consecutive_empty_checks: Mapped[int | None] = mapped_column(Integer, default=0)
+    last_position_check: Mapped[datetime | None] = mapped_column(DateTime)
+    last_position_found: Mapped[datetime | None] = mapped_column(DateTime)
+    sharing_disabled_at: Mapped[datetime | None] = mapped_column(DateTime)
+    sharing_recheck_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    # Priority for polling frequency
+    priority_score: Mapped[int | None] = mapped_column(Integer, default=50)  # 0-100
+    polling_interval_seconds: Mapped[int | None] = mapped_column(Integer, default=60)
 
     # Relationships
     stats: Mapped["WhaleStats | None"] = relationship(

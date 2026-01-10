@@ -192,6 +192,8 @@ function SettingsScreen() {
   const [localSettings, setLocalSettings] = useState({
     trading_mode: 'spot',
     auto_copy_enabled: true,
+    default_trade_size_usdt: 100,
+    max_trade_size_usdt: 1000,
     stop_loss_percent: 10,
     daily_loss_limit_usdt: 100,
     max_open_positions: 5,
@@ -220,6 +222,8 @@ function SettingsScreen() {
       setLocalSettings({
         trading_mode: settings.trading_mode?.toLowerCase() || 'spot',
         auto_copy_enabled: settings.auto_copy_enabled ?? true,
+        default_trade_size_usdt: settings.default_trade_size_usdt || 100,
+        max_trade_size_usdt: settings.max_trade_size_usdt || 1000,
         stop_loss_percent: settings.stop_loss_percent || 10,
         daily_loss_limit_usdt: settings.daily_loss_limit_usdt || 100,
         max_open_positions: settings.max_open_positions || 5,
@@ -579,6 +583,73 @@ function SettingsScreen() {
               />
             </motion.button>
           </div>
+        </div>
+
+        {/* Trade Size Settings */}
+        <div className="glass-card p-4 mb-3">
+          <div className="mb-4">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <p className="font-semibold text-white text-sm">Default Trade Size</p>
+                <p className="text-[10px] text-gray-500">Amount per trade (when not set per whale)</p>
+              </div>
+              <span className="font-mono text-biolum-cyan font-bold text-sm">
+                ${localSettings.default_trade_size_usdt}
+              </span>
+            </div>
+            <input
+              type="range"
+              min="5"
+              max="1000"
+              step="5"
+              value={localSettings.default_trade_size_usdt}
+              onChange={(e) => {
+                updateSetting('default_trade_size_usdt', Number(e.target.value))
+              }}
+              className="w-full h-2 bg-ocean-600 rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-5 [&::-webkit-slider-thumb]:h-5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-biolum-cyan [&::-webkit-slider-thumb]:shadow-[0_0_10px_rgba(0,255,200,0.4)]"
+            />
+            <div className="flex justify-between text-[10px] text-gray-600 mt-1">
+              <span>$5</span>
+              <span>$1000</span>
+            </div>
+          </div>
+
+          <div className="border-t border-ocean-600/50 pt-4">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <p className="font-semibold text-white text-sm">Max Trade Size</p>
+                <p className="text-[10px] text-gray-500">Upper limit for safety</p>
+              </div>
+              <span className="font-mono text-biolum-cyan font-bold text-sm">
+                ${localSettings.max_trade_size_usdt}
+              </span>
+            </div>
+            <input
+              type="range"
+              min="10"
+              max="5000"
+              step="10"
+              value={localSettings.max_trade_size_usdt}
+              onChange={(e) => {
+                updateSetting('max_trade_size_usdt', Number(e.target.value))
+              }}
+              className="w-full h-2 bg-ocean-600 rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-5 [&::-webkit-slider-thumb]:h-5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-biolum-cyan [&::-webkit-slider-thumb]:shadow-[0_0_10px_rgba(0,255,200,0.4)]"
+            />
+            <div className="flex justify-between text-[10px] text-gray-600 mt-1">
+              <span>$10</span>
+              <span>$5000</span>
+            </div>
+          </div>
+
+          {/* Balance Warning */}
+          {balances?.total_balance_usdt && localSettings.default_trade_size_usdt > balances.total_balance_usdt && (
+            <div className="mt-3 p-3 rounded-lg bg-loss/10 border border-loss/20">
+              <p className="text-xs text-loss flex items-center gap-1">
+                <AlertTriangle size={12} />
+                Default trade size exceeds your balance (${balances.total_balance_usdt.toFixed(2)})
+              </p>
+            </div>
+          )}
         </div>
 
         {/* Risk Profile Presets */}

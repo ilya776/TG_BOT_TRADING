@@ -7,6 +7,7 @@ from decimal import Decimal
 from enum import Enum
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Enum as SQLEnum,
     ForeignKey,
@@ -100,6 +101,9 @@ class WhaleSignal(Base):
     )
     processed_at: Mapped[datetime | None] = mapped_column(DateTime)
     error_message: Mapped[str | None] = mapped_column(Text)
+
+    # Close signal indicator (True when whale is closing a position)
+    is_close: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Metadata
     gas_price_gwei: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))

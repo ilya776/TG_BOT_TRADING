@@ -4,6 +4,7 @@ Supports both Spot and Futures (USDT-M) trading
 """
 
 import asyncio
+import logging
 import time
 from decimal import Decimal
 from typing import Any
@@ -21,6 +22,8 @@ from app.services.exchanges.base import (
     Position,
     PositionSide,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class BinanceExecutor(BaseExchange):
@@ -40,6 +43,26 @@ class BinanceExecutor(BaseExchange):
     @property
     def name(self) -> str:
         return "binance"
+
+    def normalize_symbol(self, symbol: str) -> str:
+        """
+        Normalize symbol for Binance API.
+        OKX/Bybit use symbols like BTCUSDTSWAPUSDT, Binance uses BTCUSDT.
+        """
+        symbol = symbol.upper()
+
+        # Remove SWAP suffix and dedupe USDT
+        if "SWAP" in symbol:
+            # BTCUSDTSWAPUSDT -> BTCUSDTUSDT -> BTCUSDT
+            symbol = symbol.replace("SWAP", "")
+            # Deduplicate USDT: BTCUSDTUSDT -> BTCUSDT
+            if symbol.endswith("USDTUSDT"):
+                symbol = symbol.replace("USDTUSDT", "USDT")
+
+        # Remove slashes and dashes (standard normalization)
+        symbol = symbol.replace("/", "").replace("-", "")
+
+        return symbol
 
     async def initialize(self) -> None:
         """Initialize Binance async client."""
@@ -205,22 +228,29 @@ class BinanceExecutor(BaseExchange):
     ) -> OrderResult:
         """Execute spot market buy."""
         client = self._ensure_client()
+        original_symbol = symbol
         symbol = self.normalize_symbol(symbol)
+
+        logger.info(f"Binance spot buy: {original_symbol} -> {symbol}, qty={quantity}, quote_qty={quote_order_qty}")
 
         try:
             if quote_order_qty:
                 # Buy with specific USDT amount
+                logger.info(f"Placing market buy order: symbol={symbol}, quoteOrderQty={quote_order_qty}")
                 response = await client.order_market_buy(
                     symbol=symbol,
                     quoteOrderQty=str(quote_order_qty),
                 )
             else:
+                rounded_qty = self.round_quantity(symbol, quantity)
+                logger.info(f"Placing market buy order: symbol={symbol}, quantity={rounded_qty}")
                 response = await client.order_market_buy(
                     symbol=symbol,
-                    quantity=str(self.round_quantity(symbol, quantity)),
+                    quantity=str(rounded_qty),
                 )
             return self._parse_order_result(response)
         except BinanceAPIException as e:
+            logger.error(f"Binance API error for {symbol}: code={e.code}, message={e.message}")
             raise RuntimeError(f"Binance spot buy failed: {e.message}") from e
 
     async def spot_market_sell(
@@ -230,15 +260,21 @@ class BinanceExecutor(BaseExchange):
     ) -> OrderResult:
         """Execute spot market sell."""
         client = self._ensure_client()
+        original_symbol = symbol
         symbol = self.normalize_symbol(symbol)
 
+        logger.info(f"Binance spot sell: {original_symbol} -> {symbol}, qty={quantity}")
+
         try:
+            rounded_qty = self.round_quantity(symbol, quantity)
+            logger.info(f"Placing market sell order: symbol={symbol}, quantity={rounded_qty}")
             response = await client.order_market_sell(
                 symbol=symbol,
-                quantity=str(self.round_quantity(symbol, quantity)),
+                quantity=str(rounded_qty),
             )
             return self._parse_order_result(response)
         except BinanceAPIException as e:
+            logger.error(f"Binance API error for {symbol}: code={e.code}, message={e.message}")
             raise RuntimeError(f"Binance spot sell failed: {e.message}") from e
 
     async def spot_limit_buy(
@@ -518,12 +554,16 @@ class BinanceExecutor(BaseExchange):
         symbol = self.normalize_symbol(symbol)
         info = self._symbol_info_cache.get(symbol) or self._futures_symbol_info_cache.get(symbol)
 
-        if info:
-            for f in info.get("filters", []):
-                if f["filterType"] == "LOT_SIZE":
-                    step_size = Decimal(str(f["stepSize"]))
-                    if step_size > 0:
-                        return (quantity // step_size) * step_size
+        if not info:
+            logger.warning(f"Symbol info not cached for {symbol}, using default precision")
+            # Default precision if info not available
+            return quantity.quantize(Decimal("0.00001"))
+
+        for f in info.get("filters", []):
+            if f["filterType"] == "LOT_SIZE":
+                step_size = Decimal(str(f["stepSize"]))
+                if step_size > 0:
+                    return (quantity // step_size) * step_size
 
         # Default precision
         return quantity.quantize(Decimal("0.00001"))

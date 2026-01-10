@@ -237,6 +237,8 @@ def send_position_alert(user_id: int, alert_type: str, position_data: dict):
         "stop_loss": ("🛑", "Stop-Loss Triggered"),
         "take_profit": ("🎯", "Take-Profit Reached"),
         "liquidation_warning": ("⚠️", "Liquidation Warning"),
+        "whale_exit": ("🐋", "Whale Exited Position"),
+        "manual_close": ("✋", "Position Closed"),
     }
 
     emoji, title = alert_configs.get(alert_type, ("ℹ️", "Position Alert"))

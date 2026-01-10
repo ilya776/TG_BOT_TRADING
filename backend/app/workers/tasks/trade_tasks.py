@@ -580,6 +580,35 @@ def close_position(self, user_id: int, position_id: int, reason: str = "manual")
                     f"at {order_result.avg_fill_price}, PnL: {position.realized_pnl}"
                 )
 
+                # Send position close notification
+                try:
+                    from app.workers.tasks.notification_tasks import send_position_alert
+
+                    alert_type_map = {
+                        "stop_loss": "stop_loss",
+                        "take_profit": "take_profit",
+                        "whale_exit": "whale_exit",
+                        "manual": "manual_close",
+                    }
+                    alert_type = alert_type_map.get(reason, "position_closed")
+
+                    pnl_percent = (position.realized_pnl / entry_value * 100) if entry_value > 0 else 0
+
+                    send_position_alert.delay(
+                        user_id=user_id,
+                        alert_type=alert_type,
+                        position_data={
+                            "symbol": position.symbol,
+                            "pnl": float(position.realized_pnl),
+                            "pnl_percent": float(pnl_percent),
+                            "exit_price": float(order_result.avg_fill_price),
+                            "close_reason": reason,
+                        }
+                    )
+                    logger.info(f"Sent position alert to user {user_id} for position {position_id} ({reason})")
+                except Exception as notif_error:
+                    logger.error(f"Failed to send position alert: {notif_error}")
+
                 result = {
                     "status": "success",
                     "position_id": position_id,

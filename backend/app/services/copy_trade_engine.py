@@ -106,11 +106,20 @@ class CopyTradeEngine:
             await self.db.commit()
             return results
 
-        logger.info(f"Processing signal {signal.id} for {len(followers)} followers")
+        logger.info(f"Processing signal {signal.id} for {len(followers)} followers (is_close={signal.is_close})")
 
         # Process each follower
         for follow, user, settings in followers:
             try:
+                # Handle close signals differently - close existing positions instead of opening new ones
+                if signal.is_close:
+                    result = await self._handle_close_signal(
+                        signal=signal,
+                        user=user,
+                    )
+                    results.append(result)
+                    continue
+
                 # Apply overrides if provided
                 effective_size = size_usdt_override or None
                 effective_exchange = exchange_override or None
@@ -200,6 +209,68 @@ class CopyTradeEngine:
 
         return followers
 
+    async def _handle_close_signal(
+        self,
+        signal: WhaleSignal,
+        user: User,
+    ) -> CopyTradeResult:
+        """
+        Handle a close signal by closing user's existing position from this whale.
+
+        When a whale closes their position, we need to close the follower's
+        corresponding position instead of opening a new one.
+        """
+        try:
+            # Find user's open position from this whale on this symbol
+            result = await self.db.execute(
+                select(Position).where(
+                    Position.user_id == user.id,
+                    Position.whale_id == signal.whale_id,
+                    Position.symbol == signal.cex_symbol,
+                    Position.status == PositionStatus.OPEN,
+                )
+            )
+            position = result.scalar_one_or_none()
+
+            if not position:
+                logger.info(
+                    f"No open position found for user {user.id} on {signal.cex_symbol} "
+                    f"from whale {signal.whale_id} - nothing to close"
+                )
+                return CopyTradeResult(
+                    success=True,
+                    error=None,
+                    details={"reason": "no_position_to_close"},
+                )
+
+            # Import here to avoid circular dependency
+            from app.workers.tasks.trade_tasks import close_position
+
+            # Queue the close position task
+            close_position.delay(user.id, position.id, "whale_exit")
+
+            logger.info(
+                f"WHALE_EXIT: Queued close_position for user {user.id}, position {position.id} "
+                f"(whale {signal.whale_id} exited {signal.cex_symbol})"
+            )
+
+            return CopyTradeResult(
+                success=True,
+                position_id=position.id,
+                details={
+                    "action": "close_queued",
+                    "symbol": signal.cex_symbol,
+                    "reason": "whale_exit",
+                },
+            )
+
+        except Exception as e:
+            logger.error(f"Error handling close signal for user {user.id}: {e}")
+            return CopyTradeResult(
+                success=False,
+                error=f"Failed to close position: {e}",
+            )
+
     async def _execute_copy_trade(
         self,
         signal: WhaleSignal,
@@ -221,10 +292,17 @@ class CopyTradeEngine:
                 signal=signal,
             )
 
+        # Check if trade size could be calculated
+        if trade_size_usdt is None:
+            return CopyTradeResult(
+                success=False,
+                error="No trade size configured. Please set trade_size_usdt, trade_size_percent, or default_trade_size_usdt in Settings.",
+            )
+
         if trade_size_usdt <= 0:
             return CopyTradeResult(
                 success=False,
-                error="Calculated trade size is zero or negative",
+                error=f"Trade size too small: ${trade_size_usdt}. Minimum exchange requirements not met.",
             )
 
         # Determine trading mode
@@ -312,34 +390,36 @@ class CopyTradeEngine:
             # ============================================
             # PHASE 1: RESERVE (Atomic reservation)
             # ============================================
-            try:
-                locked_user_result = await self.db.execute(
-                    select(User)
-                    .where(User.id == user.id)
-                    .with_for_update(nowait=True)
-                )
-                locked_user = locked_user_result.scalar_one_or_none()
+            # Lock user row and wait if necessary (serializes concurrent trades)
+            locked_user_result = await self.db.execute(
+                select(User)
+                .where(User.id == user.id)
+                .with_for_update()  # Wait for lock instead of failing
+            )
+            locked_user = locked_user_result.scalar_one_or_none()
 
-                if not locked_user:
-                    return CopyTradeResult(success=False, error="User not found")
+            if not locked_user:
+                return CopyTradeResult(success=False, error="User not found")
 
-                if locked_user.available_balance < trade_size_usdt:
-                    return CopyTradeResult(
-                        success=False,
-                        error=f"Insufficient balance: {locked_user.available_balance} < {trade_size_usdt}",
-                    )
-
-            except OperationalError as lock_error:
-                logger.warning(f"Trade locked for user {user.id}: {lock_error}")
+            if locked_user.available_balance < trade_size_usdt:
                 return CopyTradeResult(
                     success=False,
-                    error="Another trade is in progress. Please wait and try again.",
+                    error=f"Insufficient balance: {locked_user.available_balance} < {trade_size_usdt}",
                 )
 
+            # Normalize symbol: OKX/Bybit use BTCUSDTSWAPUSDT, Binance uses BTCUSDT
+            normalized_symbol = signal.cex_symbol
+            if "SWAP" in normalized_symbol:
+                # Remove "SWAP" and dedupe "USDT": BTCUSDTSWAPUSDT -> BTCUSDT
+                normalized_symbol = normalized_symbol.replace("SWAP", "").replace("USDTUSDT", "USDT")
+
             # Get current price for quantity calculation
-            current_price = await executor.get_ticker_price(signal.cex_symbol)
+            current_price = await executor.get_ticker_price(normalized_symbol)
             if not current_price:
-                return CopyTradeResult(success=False, error="Could not get current price")
+                logger.warning(
+                    f"Could not get price for {normalized_symbol} (original: {signal.cex_symbol})"
+                )
+                return CopyTradeResult(success=False, error=f"Could not get current price for {normalized_symbol}")
 
             quantity = trade_size_usdt / current_price
 
@@ -351,7 +431,7 @@ class CopyTradeEngine:
                 is_copy_trade=True,
                 exchange=exchange.value,
                 exchange_order_id=None,  # Will be set after exchange call
-                symbol=signal.cex_symbol,
+                symbol=normalized_symbol,  # Use normalized symbol
                 trade_type=TradeType.FUTURES if is_futures else TradeType.SPOT,
                 side=TradeSide.BUY if signal.action.value == "BUY" else TradeSide.SELL,
                 order_type=OrderType.MARKET,
@@ -468,6 +548,33 @@ class CopyTradeEngine:
                 f"at {order_result.avg_fill_price}"
             )
 
+            # Send trade execution notification
+            try:
+                if settings and settings.notify_trade_executed:
+                    from app.workers.tasks.notification_tasks import send_trade_notification
+                    from app.models.whale import Whale
+
+                    whale_result = await self.db.execute(
+                        select(Whale).where(Whale.id == signal.whale_id)
+                    )
+                    whale = whale_result.scalar_one_or_none()
+
+                    send_trade_notification.delay(
+                        user_id=user.id,
+                        trade_data={
+                            "symbol": signal.cex_symbol,
+                            "side": signal.action.value,
+                            "quantity": float(order_result.filled_quantity),
+                            "price": float(order_result.avg_fill_price),
+                            "value_usdt": float(trade_size_usdt),
+                            "status": "FILLED",
+                            "whale_name": whale.name if whale else "",
+                        }
+                    )
+                    logger.info(f"Sent trade notification to user {user.id} for trade {trade.id}")
+            except Exception as notif_error:
+                logger.error(f"Failed to send trade notification: {notif_error}")
+
             return CopyTradeResult(
                 success=True,
                 trade_id=trade.id,
@@ -519,25 +626,44 @@ class CopyTradeEngine:
         user: User,
         settings: UserSettings | None,
         signal: WhaleSignal,
-    ) -> Decimal:
-        """Calculate trade size for a copy trade."""
-        # Priority:
-        # 1. Follow-specific trade size
-        # 2. Follow-specific percentage of balance
-        # 3. User's default trade size
-        # 4. Default fallback
+    ) -> Decimal | None:
+        """
+        Calculate trade size for a copy trade.
 
+        Returns None if no trade size is configured - DO NOT use arbitrary defaults!
+        This is people's money - explicit configuration required.
+
+        Priority:
+        1. Follow-specific trade size (fixed USDT)
+        2. Follow-specific percentage of balance
+        3. User's default trade size from settings
+        """
+        calculated_size = None
+
+        # 1. Check follow-specific fixed size
         if follow.trade_size_usdt:
-            return follow.trade_size_usdt
+            calculated_size = follow.trade_size_usdt
 
-        if follow.trade_size_percent:
-            return user.available_balance * (follow.trade_size_percent / Decimal("100"))
+        # 2. Check follow-specific percentage
+        elif follow.trade_size_percent:
+            calculated_size = user.available_balance * (follow.trade_size_percent / Decimal("100"))
 
-        if settings and settings.default_trade_size_usdt:
-            return settings.default_trade_size_usdt
+        # 3. Check user's default trade size
+        elif settings and settings.default_trade_size_usdt:
+            calculated_size = settings.default_trade_size_usdt
 
-        # Default: 1% of balance
-        return user.available_balance * Decimal("0.01")
+        # NO DEFAULT FALLBACK - require explicit configuration!
+        if calculated_size is None:
+            return None
+
+        # Validate against max_trade_size from settings
+        if settings and settings.max_trade_size_usdt:
+            calculated_size = min(calculated_size, settings.max_trade_size_usdt)
+
+        # Never exceed available balance
+        calculated_size = min(calculated_size, user.available_balance)
+
+        return calculated_size
 
     def _should_use_futures(
         self,
